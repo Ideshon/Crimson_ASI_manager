@@ -272,6 +272,20 @@ class AsiManagerApp:
         self._build_ui()
         self._load_last_target()
         self._register_dnd()
+        self.root.protocol("WM_DELETE_WINDOW", self.close_app)
+
+    def close_app(self) -> None:
+        """Корректно закрывает окно и завершает процесс без зависшей bat-консоли."""
+        try:
+            self.save_note()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        finally:
+            # Если запускали из .bat без pause, процесс завершится, а консоль закроется.
+            # При запуске из уже открытого терминала сам терминал, естественно, не убиваем.
+            sys.exit(0)
 
     def _build_ui(self) -> None:
         self._build_menu()
@@ -395,7 +409,7 @@ class AsiManagerApp:
         file_menu.add_command(label="Добавить моды...", command=self.add_via_dialog)
         file_menu.add_command(label="Сканировать папку", command=self.rescan)
         file_menu.add_separator()
-        file_menu.add_command(label="Выход", command=self.root.destroy)
+        file_menu.add_command(label="Выход", command=self.close_app)
         menu.add_cascade(label="Файл", menu=file_menu)
 
         mod_menu = tk.Menu(menu, tearoff=False)
@@ -435,6 +449,7 @@ class AsiManagerApp:
         target = detect_asi_target(path)
         target.mkdir(parents=True, exist_ok=True)
         self.state = State(target)
+        self._cleanup_old_unpacked_duplicate_backups()
         self.target_var.set(str(target))
         save_app_settings({"target_dir": str(target)})
         self.rescan(silent=True)
@@ -620,7 +635,7 @@ class AsiManagerApp:
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         mod_name = safe_name(str(mod.get("name", mod_id)))
         duplicate_dir = state.target_dir / DUPLICATE_BACKUP_DIR_NAME / f"{timestamp}_{mod_name}"
-        moved_root = duplicate_dir / "files"
+                                            
         duplicate_dir.mkdir(parents=True, exist_ok=True)
         archive_path = duplicate_dir / "previous_files.zip"
 
@@ -642,27 +657,47 @@ class AsiManagerApp:
                 if enabled.exists():
                     src = enabled
                     logical_rel = f"bin64/{rel}"
-                    moved = moved_root / "bin64" / rel
+                                                      
                 elif disabled.exists():
                     src = disabled
                     logical_rel = f"{ASIBAK_DIR_NAME}/{mod_id}/{rel}.bak"
-                    moved = moved_root / ASIBAK_DIR_NAME / mod_id / f"{rel}.bak"
+                                                                                
                 else:
                     manifest["files"].append({"rel": rel, "status": "missing"})
                     continue
 
                 zf.write(src, logical_rel)
                 manifest["files"].append({"rel": rel, "archived_as": logical_rel})
-                moved.parent.mkdir(parents=True, exist_ok=True)
-                if moved.exists():
-                    moved.unlink()
-                shutil.move(str(src), str(moved))
+                                                               
+                                  
+                src.unlink()
+                                                 
 
             zf.writestr("_asi_manager_duplicate_info.json", json.dumps(manifest, ensure_ascii=False, indent=2))
 
         self._remove_empty_dirs(state.asibak_dir / mod_id)
-        self._remove_empty_dirs(moved_root)
+                                           
         return archive_path
+
+    def _cleanup_old_unpacked_duplicate_backups(self) -> None:
+        """Удаляет распакованные дубликаты, оставленные старыми версиями менеджера.
+
+        Удаляется только папка asiduplicates/*/files, если рядом есть previous_files.zip.
+        Сам zip-архив не трогаем.
+        """
+        state = self.state
+        if not state:
+            return
+        duplicates_root = state.target_dir / DUPLICATE_BACKUP_DIR_NAME
+        if not duplicates_root.exists():
+            return
+        for duplicate_dir in duplicates_root.iterdir():
+            if not duplicate_dir.is_dir():
+                continue
+            archive_path = duplicate_dir / "previous_files.zip"
+            unpacked = duplicate_dir / "files"
+            if archive_path.exists() and unpacked.exists() and unpacked.is_dir():
+                shutil.rmtree(unpacked, ignore_errors=True)
 
     @staticmethod
     def _remove_empty_dirs(root: Path) -> None:
