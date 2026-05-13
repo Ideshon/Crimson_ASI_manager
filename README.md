@@ -1,4 +1,4 @@
-# -Crimson Desert ASI Manager
+# Crimson Desert ASI Manager
 ==========================
 
 ## EN
