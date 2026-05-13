@@ -2,33 +2,37 @@
 ==========================
 
 ## EN
-What it does:
-- Selects the game folder or the bin64 folder. If the game folder is selected and it contains a bin64 folder, it uses the bin64 folder.
-- Adds mods from files, folders, and archives.
-- Drag-and-drop works if tkinterdnd2 is installed: pip install tkinterdnd2
-- Without tkinterdnd2, you can add mods via the File -> Add Mods menu.
-- ZIP/TAR archives are extracted using Python tools.
-- 7Z/RAR require 7-Zip to be installed and in the PATH.
-- Groups mod files: everything from a single archive/folder is considered a single mod.
-- When scanning already installed .asi files, it looks for files with the same name nearby, for example Mod.asi + Mod.ini + Mod.dll.
-- Disabling moves mod files to bin64/asibak/<mod_id>/ and adds .bak to the filename.
-- Enabling moves the files back.
+What does:
+- Selects the game folder or bin64. If the game folder is selected and bin64 is inside, bin64 is used.
+- Adds mods from files, folders and archives.
+- Drag-and-drop works with tkinterdnd2 installed: pip install tkinterdnd2
+- Without tkinterdnd2, adding works via the File -> Add Mods menu.
+- ZIP/TAR archives are unpacked using Python tools.
+- 7Z/RAR require an installed 7-Zip in the PATH.
+- Groups mod files: everything from one archive/folder is considered one mod.
+- When scanning already installed ones .asi searches for files with the same name nearby, for example Mod.asi + Mod.ini + Mod.dll .
+- Disabling transfers the mod files to bin64/asibak/<mod_id>/ and adds .bak to the file name.
+- Enabling returns files back.
 - Notes are stored in bin64/ASIModManager/state.json.
-- You can open the .ini or selected file using the default editor/application.
+- You can open the .ini or the selected file through the default editor/application.
+- When replacing a duplicate, the old mod files are added to previous_files.zip
 
-Setup:
+**Important:**
+- Make a backup copy of bin64 before using it for the first time, because mods like to break, as if it were their spiritual practice.
+- After adding the old .asi/.ini/.dll/other files to the archive, they are deleted from bin64/asiduplicates and from the working folder.
+
+Launch:
 1. Install Python 3.10+ for Windows.
-2. Run run_crimson_asi_manager.bat or execute:
-   py -3 crimson_asi_manager.py
+2. For drag-and-drop:
+      py -3 -m pip install tkinterdnd2
+3. Launch:
+   1) Normal startup:
+      run_crimson_asi_manager.bat
+The console will close after the program window is closed. In this version, pause is removed.
 
-For drag-and-drop:
-   py -3 -m pip install tkinterdnd2
-
-Important:
-- Before using it for the first time, make a backup of bin64, because mods love to break as if it were their spiritual practice.
-- If the file already exists and the manager overwrites it, the old version is copied to bin64/asimanager_conflict_backups/.
-
-Translated with DeepL.com (free version)
+   2) Launch without a console:
+      run_crimson_asi_manager_no_console.bat
+or double-click on crimson_asi_manager.pyw.
 
 ## RU
 Что делает:
@@ -44,15 +48,21 @@ Translated with DeepL.com (free version)
 - Включение возвращает файлы обратно.
 - Заметки хранятся в bin64/ASIModManager/state.json.
 - Можно открыть .ini или выбранный файл через редактор/приложение по умолчанию.
+- При замене дубликата старые файлы мода добавляются в previous_files.zip
+
+**Важно:**
+- Перед первым использованием сделайте резервную копию bin64, потому что моды любят ломаться, как будто это их духовная практика.
+- После добавления в архив старые .asi/.ini/.dll/прочие файлы удаляются из bin64/asiduplicates и из рабочей папки.
 
 Запуск:
 1. Установите Python 3.10+ для Windows.
-2. Запустите run_crimson_asi_manager.bat или выполните:
-   py -3 crimson_asi_manager.py
+2. Для drag-and-drop:
+      py -3 -m pip install tkinterdnd2
+3. Запуск:
+   1) Обычный запуск:
+      run_crimson_asi_manager.bat
+      Консоль закроется после закрытия окна программы. В этой версии pause убран.
 
-Для drag-and-drop:
-   py -3 -m pip install tkinterdnd2
-
-Важно:
-- Перед первым использованием сделайте резервную копию bin64, потому что моды любят ломаться, как будто это их духовная практика.
-- Если файл уже существует и менеджер его перезаписывает, старая версия копируется в bin64/asimanager_conflict_backups/.
+   2) Запуск без консоли:
+      run_crimson_asi_manager_no_console.bat
+      или двойной клик по crimson_asi_manager.pyw.

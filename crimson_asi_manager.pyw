@@ -623,7 +623,7 @@ class AsiManagerApp:
         return 1 if copied_rels else 0
 
     def _archive_and_move_previous_mod_files(self, mod_id: str) -> Path | None:
-        """Перед заменой дубликатом сохраняет старую версию мода целиком."""
+        """Перед заменой дубликатом архивирует старую версию мода и удаляет старые файлы."""
         state = self.require_state()
         if not state:
             return None
@@ -635,7 +635,6 @@ class AsiManagerApp:
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         mod_name = safe_name(str(mod.get("name", mod_id)))
         duplicate_dir = state.target_dir / DUPLICATE_BACKUP_DIR_NAME / f"{timestamp}_{mod_name}"
-                                            
         duplicate_dir.mkdir(parents=True, exist_ok=True)
         archive_path = duplicate_dir / "previous_files.zip"
 
@@ -657,26 +656,20 @@ class AsiManagerApp:
                 if enabled.exists():
                     src = enabled
                     logical_rel = f"bin64/{rel}"
-                                                      
                 elif disabled.exists():
                     src = disabled
                     logical_rel = f"{ASIBAK_DIR_NAME}/{mod_id}/{rel}.bak"
-                                                                                
                 else:
                     manifest["files"].append({"rel": rel, "status": "missing"})
                     continue
 
                 zf.write(src, logical_rel)
                 manifest["files"].append({"rel": rel, "archived_as": logical_rel})
-                                                               
-                                  
                 src.unlink()
-                                                 
 
             zf.writestr("_asi_manager_duplicate_info.json", json.dumps(manifest, ensure_ascii=False, indent=2))
 
         self._remove_empty_dirs(state.asibak_dir / mod_id)
-                                           
         return archive_path
 
     def _cleanup_old_unpacked_duplicate_backups(self) -> None:
