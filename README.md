@@ -27,12 +27,12 @@ Launch:
       py -3 -m pip install tkinterdnd2
 3. Launch:
    1) Normal startup:
-      run_crimson_asi_manager.bat
-The console will close after the program window is closed. In this version, pause is removed.
+      - run_crimson_asi_manager.bat
+      - The console will close after the program window is closed. In this version, pause is removed.
 
    2) Launch without a console:
-      run_crimson_asi_manager_no_console.bat
-or double-click on crimson_asi_manager.pyw.
+      - run_crimson_asi_manager_no_console.bat
+      - or double-click on crimson_asi_manager.pyw.
 
 ## RU
 Что делает:
@@ -60,9 +60,9 @@ or double-click on crimson_asi_manager.pyw.
       py -3 -m pip install tkinterdnd2
 3. Запуск:
    1) Обычный запуск:
-      run_crimson_asi_manager.bat
-      Консоль закроется после закрытия окна программы. В этой версии pause убран.
+      - run_crimson_asi_manager.bat
+      - Консоль закроется после закрытия окна программы. В этой версии pause убран.
 
    2) Запуск без консоли:
-      run_crimson_asi_manager_no_console.bat
-      или двойной клик по crimson_asi_manager.pyw.
+      - run_crimson_asi_manager_no_console.bat
+      - или двойной клик по crimson_asi_manager.pyw.
