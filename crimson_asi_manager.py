@@ -15,6 +15,7 @@ Crimson Desert ASI Manager
 from __future__ import annotations
 
 import json
+import logging
 import os
 import platform
 import re
@@ -53,6 +54,36 @@ IGNORED_TOP_NAMES = {
     CONFLICT_BACKUP_DIR_NAME.lower(),
     DUPLICATE_BACKUP_DIR_NAME.lower(),
 }
+APP_VERSION = "v4-logging"
+
+
+def setup_logging() -> logging.Logger:
+    """Настраивает логирование для консольного запуска.
+
+    В .pyw-запуске консоли обычно нет, поэтому там используется NullHandler.
+    В обычном .py/.bat-запуске сообщения идут прямо в stdout.
+    """
+    logger = logging.getLogger("crimson_asi_manager")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if logger.handlers:
+        return logger
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    stdout = getattr(sys, "stdout", None)
+    if stdout and hasattr(stdout, "write"):
+        handler = logging.StreamHandler(stdout)
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    else:
+        logger.addHandler(logging.NullHandler())
+    return logger
+
+
+LOGGER = setup_logging()
 
 
 @dataclass
@@ -269,6 +300,7 @@ class AsiManagerApp:
         self.show_disabled_var = BooleanVar(value=True)
         self._sort_reverse: dict[tuple[int, str], bool] = {}
 
+        LOGGER.info("Запуск %s %s. Drag-and-drop: %s", APP_NAME, APP_VERSION, "доступен" if DND_AVAILABLE else "недоступен")
         self._build_ui()
         self._load_last_target()
         self._register_dnd()
@@ -276,6 +308,7 @@ class AsiManagerApp:
 
     def close_app(self) -> None:
         """Корректно закрывает окно и завершает процесс без зависшей bat-консоли."""
+        LOGGER.info("Закрытие программы")
         try:
             self.save_note()
         except Exception:
@@ -448,6 +481,7 @@ class AsiManagerApp:
     def set_target_dir(self, path: Path) -> None:
         target = detect_asi_target(path)
         target.mkdir(parents=True, exist_ok=True)
+        LOGGER.info("Выбрана рабочая папка ASI: %s", target)
         self.state = State(target)
         self._cleanup_old_unpacked_duplicate_backups()
         self.target_var.set(str(target))
@@ -472,6 +506,7 @@ class AsiManagerApp:
             ),
         )
         if paths:
+            LOGGER.info("Добавление через диалог: %s", "; ".join(paths))
             self.install_paths([Path(p) for p in paths])
 
     def on_drop(self, event) -> None:  # noqa: ANN001
@@ -484,12 +519,14 @@ class AsiManagerApp:
         except Exception:
             parts = raw.split()
         paths = [Path(p) for p in parts if p]
+        LOGGER.info("Добавление drag-and-drop: %s", "; ".join(str(p) for p in paths))
         self.install_paths(paths)
 
     def install_paths(self, paths: list[Path]) -> None:
         state = self.require_state()
         if not state:
             return
+        LOGGER.info("Начата установка: %d объект(ов)", len(paths))
         installed = 0
         errors: list[str] = []
         for path in paths:
@@ -499,6 +536,7 @@ class AsiManagerApp:
                     continue
                 installed += self._install_one(path)
             except Exception as exc:
+                LOGGER.exception("Ошибка установки %s", path)
                 errors.append(f"{path}: {exc}")
         state.save()
         self.refresh_mods()
@@ -506,9 +544,11 @@ class AsiManagerApp:
         if errors:
             msg += " Ошибки: " + "; ".join(errors[:4])
             messagebox.showwarning(APP_NAME, msg)
+        LOGGER.info(msg)
         self.status_var.set(msg)
 
     def _install_one(self, source: Path) -> int:
+        LOGGER.info("Обработка источника: %s", source)
         if source.is_dir():
             base = source
             return self._install_from_folder(base, source.name, f"folder:{source}")
@@ -520,6 +560,7 @@ class AsiManagerApp:
     def _install_from_archive(self, archive: Path) -> int:
         with tempfile.TemporaryDirectory(prefix="crimson_asi_mod_") as tmp_str:
             tmp = Path(tmp_str)
+            LOGGER.info("Распаковка архива: %s", archive)
             self._unpack_archive(archive, tmp)
             base = single_top_folder_base(tmp)
             return self._install_from_folder(base, archive.stem, f"archive:{archive.name}")
@@ -527,15 +568,18 @@ class AsiManagerApp:
     def _unpack_archive(self, archive: Path, destination: Path) -> None:
         name = archive.name.lower()
         if zipfile.is_zipfile(archive):
+            LOGGER.info("Архив распознан как ZIP")
             with zipfile.ZipFile(archive) as zf:
                 zf.extractall(destination)
             return
         if tarfile.is_tarfile(archive):
+            LOGGER.info("Архив распознан как TAR")
             with tarfile.open(archive) as tf:
                 tf.extractall(destination)
             return
         if name.endswith((".7z", ".rar")):
             seven_zip = shutil.which("7z") or shutil.which("7za") or shutil.which("7zz")
+            LOGGER.info("Архив распознан как 7z/rar, используется внешний 7-Zip")
             if not seven_zip:
                 raise RuntimeError("Для .7z/.rar нужен установленный 7-Zip в PATH. ZIP работает без него.")
             result = subprocess.run(
@@ -555,6 +599,7 @@ class AsiManagerApp:
             raise RuntimeError(f"Архив не поддержан: {archive.suffix}") from exc
 
     def _install_from_folder(self, folder: Path, mod_name: str, source_label: str) -> int:
+        LOGGER.info("Установка из папки: %s", folder)
         files = list_files_recursive(folder)
         if not files:
             raise RuntimeError("в папке/архиве нет файлов")
@@ -581,11 +626,13 @@ class AsiManagerApp:
         if not state:
             return 0
         mod_name = safe_name(mod_name)
+        LOGGER.info("Подготовка установки мода: %s, файлов: %d, источник: %s", mod_name, len(files), source_label)
         incoming_has_asi = any(file.suffix.lower() == ".asi" for file in files)
         mod_id = self._find_existing_mod_for_source_or_name(source_label, mod_name)
         duplicate_backup: Path | None = None
         if not mod_id:
             mod_id = unique_mod_id(state.mods, mod_name)
+            LOGGER.info("Создаётся новая запись мода: %s (%s)", mod_name, mod_id)
             state.mods[mod_id] = {
                 "name": mod_name,
                 "enabled": True,
@@ -595,6 +642,7 @@ class AsiManagerApp:
                 "notes": "",
             }
         elif incoming_has_asi:
+            LOGGER.info("Найден дубликат мода: %s (%s). Старая версия будет заархивирована и удалена", mod_name, mod_id)
             duplicate_backup = self._archive_and_move_previous_mod_files(mod_id)
             state.mods[mod_id]["files"] = []
         mod = state.mods[mod_id]
@@ -609,6 +657,7 @@ class AsiManagerApp:
             target.parent.mkdir(parents=True, exist_ok=True)
             self._backup_if_conflict(target, mod_id, rel)
             shutil.copy2(file, target)
+            LOGGER.info("Скопирован файл: %s -> %s", file, target)
             copied_rels.append(rel)
             if rel not in existing_rels:
                 mod.setdefault("files", []).append({"rel": rel, "added_at": now_iso()})
@@ -623,7 +672,11 @@ class AsiManagerApp:
         return 1 if copied_rels else 0
 
     def _archive_and_move_previous_mod_files(self, mod_id: str) -> Path | None:
-        """Перед заменой дубликатом сохраняет старую версию мода целиком."""
+        """Перед заменой дубликатом архивирует старую версию мода и удаляет старые файлы.
+
+        Важно: распакованные .asi/.ini/.dll не оставляем внутри bin64/asiduplicates,
+        потому что некоторые ASI-загрузчики и игры могут просматривать подпапки.
+        """
         state = self.require_state()
         if not state:
             return None
@@ -635,7 +688,6 @@ class AsiManagerApp:
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         mod_name = safe_name(str(mod.get("name", mod_id)))
         duplicate_dir = state.target_dir / DUPLICATE_BACKUP_DIR_NAME / f"{timestamp}_{mod_name}"
-                                            
         duplicate_dir.mkdir(parents=True, exist_ok=True)
         archive_path = duplicate_dir / "previous_files.zip"
 
@@ -647,6 +699,7 @@ class AsiManagerApp:
             "files": [],
         }
 
+        LOGGER.info("Архивация старой версии мода %s в %s", mod.get("name", mod_id), archive_path)
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for item in files:
                 rel = normalize_rel(item.get("rel", ""))
@@ -657,26 +710,23 @@ class AsiManagerApp:
                 if enabled.exists():
                     src = enabled
                     logical_rel = f"bin64/{rel}"
-                                                      
                 elif disabled.exists():
                     src = disabled
                     logical_rel = f"{ASIBAK_DIR_NAME}/{mod_id}/{rel}.bak"
-                                                                                
                 else:
+                    LOGGER.warning("Файл старой версии не найден и не будет архивирован: %s", rel)
                     manifest["files"].append({"rel": rel, "status": "missing"})
                     continue
 
                 zf.write(src, logical_rel)
                 manifest["files"].append({"rel": rel, "archived_as": logical_rel})
-                                                               
-                                  
                 src.unlink()
-                                                 
+                LOGGER.info("Архивирован и удалён старый файл: %s", src)
 
             zf.writestr("_asi_manager_duplicate_info.json", json.dumps(manifest, ensure_ascii=False, indent=2))
 
         self._remove_empty_dirs(state.asibak_dir / mod_id)
-                                           
+        LOGGER.info("Архив старой версии готов: %s", archive_path)
         return archive_path
 
     def _cleanup_old_unpacked_duplicate_backups(self) -> None:
@@ -697,6 +747,7 @@ class AsiManagerApp:
             archive_path = duplicate_dir / "previous_files.zip"
             unpacked = duplicate_dir / "files"
             if archive_path.exists() and unpacked.exists() and unpacked.is_dir():
+                LOGGER.info("Удалена старая распакованная папка дубликата: %s", unpacked)
                 shutil.rmtree(unpacked, ignore_errors=True)
 
     @staticmethod
@@ -725,6 +776,7 @@ class AsiManagerApp:
         backup = backup_root / rel
         backup.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(target, backup)
+        LOGGER.warning("Конфликт файла %s: резервная копия создана в %s", rel, backup)
 
     def _owner_of_rel(self, rel: str) -> str | None:
         state = self.require_state()
@@ -764,6 +816,7 @@ class AsiManagerApp:
             mod_name = asi.stem
             mod_id = unique_mod_id(state.mods, mod_name)
             related = self._detect_related_files_for_existing_asi(asi)
+            LOGGER.info("Сканирован новый ASI-мод: %s", asi.name)
             state.mods[mod_id] = {
                 "name": safe_name(mod_name),
                 "enabled": True,
@@ -776,6 +829,7 @@ class AsiManagerApp:
             self._sort_mod_files(state.mods[mod_id])
             found += 1
         state.save()
+        LOGGER.info("Сканирование завершено. Новых ASI-модов: %d", found)
         self.refresh_mods()
         if not silent:
             self.status_var.set(f"Сканирование завершено. Найдено новых ASI-модов: {found}.")
@@ -877,6 +931,7 @@ class AsiManagerApp:
             self.refresh_mods()
             self.load_mod_details(mod_id)
         except Exception as exc:
+            LOGGER.exception("Ошибка переключения мода %s", mod_id)
             messagebox.showerror(APP_NAME, str(exc))
 
     def disable_mod(self, mod_id: str) -> None:
@@ -895,9 +950,11 @@ class AsiManagerApp:
             if dst.exists():
                 dst.unlink()
             shutil.move(str(src), str(dst))
+            LOGGER.info("Отключение файла: %s -> %s", src, dst)
             moved += 1
         mod["enabled"] = False
         mod["updated_at"] = now_iso()
+        LOGGER.info("Отключено: %s. Перемещено файлов: %d", mod.get("name", mod_id), moved)
         self.status_var.set(f"Отключено: {mod.get('name', mod_id)}. Перемещено файлов: {moved}.")
 
     def enable_mod(self, mod_id: str) -> None:
@@ -917,9 +974,11 @@ class AsiManagerApp:
             if dst.exists():
                 dst.unlink()
             shutil.move(str(src), str(dst))
+            LOGGER.info("Включение файла: %s -> %s", src, dst)
             moved += 1
         mod["enabled"] = True
         mod["updated_at"] = now_iso()
+        LOGGER.info("Включено: %s. Возвращено файлов: %d", mod.get("name", mod_id), moved)
         self.status_var.set(f"Включено: {mod.get('name', mod_id)}. Возвращено файлов: {moved}.")
 
     def selected_file_path(self) -> Path | None:
@@ -938,8 +997,10 @@ class AsiManagerApp:
             messagebox.showinfo(APP_NAME, "Выберите файл мода в списке.")
             return
         try:
+            LOGGER.info("Открытие файла: %s", path)
             open_with_default_app(path)
         except Exception as exc:
+            LOGGER.exception("Ошибка открытия файла %s", path)
             messagebox.showerror(APP_NAME, str(exc))
 
     def open_first_ini(self) -> None:
@@ -958,8 +1019,10 @@ class AsiManagerApp:
             messagebox.showinfo(APP_NAME, "У этого мода не найден .ini файл.")
             return
         try:
+            LOGGER.info("Открытие ini-файла: %s", ini_candidates[0])
             open_with_default_app(ini_candidates[0])
         except Exception as exc:
+            LOGGER.exception("Ошибка открытия ini-файла %s", ini_candidates[0])
             messagebox.showerror(APP_NAME, str(exc))
 
     def open_target_dir(self) -> None:
@@ -967,8 +1030,10 @@ class AsiManagerApp:
         if not state:
             return
         try:
+            LOGGER.info("Открытие рабочей папки: %s", state.target_dir)
             open_with_default_app(state.target_dir)
         except Exception as exc:
+            LOGGER.exception("Ошибка открытия рабочей папки %s", state.target_dir)
             messagebox.showerror(APP_NAME, str(exc))
 
     def run(self) -> None:
@@ -976,6 +1041,7 @@ class AsiManagerApp:
 
 
 def main() -> None:
+    LOGGER.info("Старт %s %s", APP_NAME, APP_VERSION)
     app = AsiManagerApp()
     app.run()
 
