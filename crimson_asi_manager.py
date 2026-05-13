@@ -45,8 +45,14 @@ STATE_DIR_NAME = "ASIModManager"
 STATE_FILE_NAME = "state.json"
 ASIBAK_DIR_NAME = "asibak"
 CONFLICT_BACKUP_DIR_NAME = "asimanager_conflict_backups"
+DUPLICATE_BACKUP_DIR_NAME = "asiduplicates"
 SUPPORTED_ARCHIVE_EXTS = {".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar"}
-IGNORED_TOP_NAMES = {STATE_DIR_NAME.lower(), ASIBAK_DIR_NAME.lower(), CONFLICT_BACKUP_DIR_NAME.lower()}
+IGNORED_TOP_NAMES = {
+    STATE_DIR_NAME.lower(),
+    ASIBAK_DIR_NAME.lower(),
+    CONFLICT_BACKUP_DIR_NAME.lower(),
+    DUPLICATE_BACKUP_DIR_NAME.lower(),
+}
 
 
 @dataclass
@@ -261,6 +267,7 @@ class AsiManagerApp:
         self.target_var = StringVar(value="Папка ASI не выбрана")
         self.status_var = StringVar(value="Выберите папку игры или bin64.")
         self.show_disabled_var = BooleanVar(value=True)
+        self._sort_reverse: dict[tuple[int, str], bool] = {}
 
         self._build_ui()
         self._load_last_target()
@@ -296,11 +303,11 @@ class AsiManagerApp:
             show="tree headings",
             selectmode="browse",
         )
-        self.mods_tree.heading("#0", text="Мод")
-        self.mods_tree.heading("status", text="Статус")
-        self.mods_tree.heading("files", text="Файлы")
-        self.mods_tree.heading("mtime", text="Изменён")
-        self.mods_tree.heading("source", text="Источник")
+        self.mods_tree.heading("#0", text="Мод", command=lambda: self.sort_tree(self.mods_tree, "#0"))
+        self.mods_tree.heading("status", text="Статус", command=lambda: self.sort_tree(self.mods_tree, "status"))
+        self.mods_tree.heading("files", text="Файлы", command=lambda: self.sort_tree(self.mods_tree, "files"))
+        self.mods_tree.heading("mtime", text="Изменён", command=lambda: self.sort_tree(self.mods_tree, "mtime"))
+        self.mods_tree.heading("source", text="Источник", command=lambda: self.sort_tree(self.mods_tree, "source"))
         self.mods_tree.column("#0", width=230, minwidth=160)
         self.mods_tree.column("status", width=95, anchor=W)
         self.mods_tree.column("files", width=55, anchor=W)
@@ -317,11 +324,11 @@ class AsiManagerApp:
         ttk.Button(right_top, text="Открыть папку", command=self.open_target_dir).pack(side=LEFT, padx=(6, 0))
         ttk.Button(right_top, text="Сохранить заметку", command=self.save_note).pack(side=RIGHT)
 
-        self.files_tree = ttk.Treeview(right, columns=("mtime", "place"), show="headings", selectmode="browse")
-        self.files_tree.heading("#1", text="Файл")
-        self.files_tree.heading("mtime", text="Изменён")
-        self.files_tree.heading("place", text="Где лежит")
-        self.files_tree.column("#1", width=420, minwidth=250)
+        self.files_tree = ttk.Treeview(right, columns=("file", "mtime", "place"), show="headings", selectmode="browse")
+        self.files_tree.heading("file", text="Файл", command=lambda: self.sort_tree(self.files_tree, "file"))
+        self.files_tree.heading("mtime", text="Изменён", command=lambda: self.sort_tree(self.files_tree, "mtime"))
+        self.files_tree.heading("place", text="Где лежит", command=lambda: self.sort_tree(self.files_tree, "place"))
+        self.files_tree.column("file", width=420, minwidth=250, anchor=W)
         self.files_tree.column("mtime", width=140, anchor=W)
         self.files_tree.column("place", width=120, anchor=W)
         self.files_tree.pack(fill=BOTH, expand=True)
@@ -338,6 +345,47 @@ class AsiManagerApp:
 
         if not DND_AVAILABLE:
             self.status_var.set("Drag-and-drop отключён: установите tkinterdnd2. Меню добавления работает.")
+
+    def sort_tree(self, tree: ttk.Treeview, column: str) -> None:
+        """Сортировка Treeview по нажатию на заголовок."""
+        key = (id(tree), column)
+        reverse = self._sort_reverse.get(key, False)
+        items = list(tree.get_children(""))
+        items.sort(key=lambda item: self._tree_sort_value(tree, item, column), reverse=reverse)
+        for index, item in enumerate(items):
+            tree.move(item, "", index)
+        self._sort_reverse[key] = not reverse
+
+    def _tree_sort_value(self, tree: ttk.Treeview, item: str, column: str):  # noqa: ANN001
+        if column == "#0":
+            value = tree.item(item, "text")
+        else:
+            columns = list(tree["columns"])
+            values = list(tree.item(item, "values"))
+            try:
+                index = columns.index(column)
+                value = values[index] if index < len(values) else ""
+            except ValueError:
+                value = ""
+        return self._sortable_value(column, value)
+
+    @staticmethod
+    def _sortable_value(column: str, value: object):  # noqa: ANN001
+        text = str(value)
+        if text in {"нет файла", ""}:
+            return (9, text.lower())
+        if column == "files":
+            try:
+                return (0, int(text))
+            except ValueError:
+                pass
+        try:
+            return (1, datetime.strptime(text, "%Y-%m-%d %H:%M").timestamp())
+        except ValueError:
+            pass
+        parts = re.split(r"(\d+)", text.lower())
+        natural = tuple(int(part) if part.isdigit() else part for part in parts)
+        return (2, natural)
 
     def _build_menu(self) -> None:
         menu = tk.Menu(self.root)
@@ -518,7 +566,9 @@ class AsiManagerApp:
         if not state:
             return 0
         mod_name = safe_name(mod_name)
+        incoming_has_asi = any(file.suffix.lower() == ".asi" for file in files)
         mod_id = self._find_existing_mod_for_source_or_name(source_label, mod_name)
+        duplicate_backup: Path | None = None
         if not mod_id:
             mod_id = unique_mod_id(state.mods, mod_name)
             state.mods[mod_id] = {
@@ -529,6 +579,9 @@ class AsiManagerApp:
                 "installed_at": now_iso(),
                 "notes": "",
             }
+        elif incoming_has_asi:
+            duplicate_backup = self._archive_and_move_previous_mod_files(mod_id)
+            state.mods[mod_id]["files"] = []
         mod = state.mods[mod_id]
         existing_rels = {item["rel"] for item in mod.get("files", [])}
         copied_rels: list[str] = []
@@ -549,8 +602,82 @@ class AsiManagerApp:
         mod["enabled"] = True
         mod["updated_at"] = now_iso()
         mod["source"] = source_label
+        if duplicate_backup:
+            mod.setdefault("duplicate_backups", []).append(str(duplicate_backup))
         self._sort_mod_files(mod)
         return 1 if copied_rels else 0
+
+    def _archive_and_move_previous_mod_files(self, mod_id: str) -> Path | None:
+        """Перед заменой дубликатом сохраняет старую версию мода целиком."""
+        state = self.require_state()
+        if not state:
+            return None
+        mod = state.mods.get(mod_id, {})
+        files = list(mod.get("files", []))
+        if not files:
+            return None
+
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        mod_name = safe_name(str(mod.get("name", mod_id)))
+        duplicate_dir = state.target_dir / DUPLICATE_BACKUP_DIR_NAME / f"{timestamp}_{mod_name}"
+        moved_root = duplicate_dir / "files"
+        duplicate_dir.mkdir(parents=True, exist_ok=True)
+        archive_path = duplicate_dir / "previous_files.zip"
+
+        manifest = {
+            "mod_id": mod_id,
+            "mod_name": mod.get("name", mod_id),
+            "created_at": now_iso(),
+            "reason": "duplicate_before_replace",
+            "files": [],
+        }
+
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for item in files:
+                rel = normalize_rel(item.get("rel", ""))
+                if not rel:
+                    continue
+                enabled = state.enabled_path(rel)
+                disabled = state.disabled_path(mod_id, rel)
+                if enabled.exists():
+                    src = enabled
+                    logical_rel = f"bin64/{rel}"
+                    moved = moved_root / "bin64" / rel
+                elif disabled.exists():
+                    src = disabled
+                    logical_rel = f"{ASIBAK_DIR_NAME}/{mod_id}/{rel}.bak"
+                    moved = moved_root / ASIBAK_DIR_NAME / mod_id / f"{rel}.bak"
+                else:
+                    manifest["files"].append({"rel": rel, "status": "missing"})
+                    continue
+
+                zf.write(src, logical_rel)
+                manifest["files"].append({"rel": rel, "archived_as": logical_rel})
+                moved.parent.mkdir(parents=True, exist_ok=True)
+                if moved.exists():
+                    moved.unlink()
+                shutil.move(str(src), str(moved))
+
+            zf.writestr("_asi_manager_duplicate_info.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+
+        self._remove_empty_dirs(state.asibak_dir / mod_id)
+        self._remove_empty_dirs(moved_root)
+        return archive_path
+
+    @staticmethod
+    def _remove_empty_dirs(root: Path) -> None:
+        if not root.exists() or not root.is_dir():
+            return
+        for path in sorted(root.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+            if path.is_dir():
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+        try:
+            root.rmdir()
+        except OSError:
+            pass
 
     def _backup_if_conflict(self, target: Path, mod_id: str, rel: str) -> None:
         state = self.require_state()
