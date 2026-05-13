@@ -623,11 +623,7 @@ class AsiManagerApp:
         return 1 if copied_rels else 0
 
     def _archive_and_move_previous_mod_files(self, mod_id: str) -> Path | None:
-        """Перед заменой дубликатом архивирует старую версию мода и удаляет старые файлы.
-
-        Важно: распакованные .asi/.ini/.dll не оставляем внутри bin64/asiduplicates,
-        потому что некоторые ASI-загрузчики и игры могут просматривать подпапки.
-        """
+        """Перед заменой дубликатом архивирует старую версию мода и удаляет старые файлы."""
         state = self.require_state()
         if not state:
             return None
