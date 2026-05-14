@@ -1,3 +1,2 @@
 @echo off
-cd /d "%~dp0"
-py -3 -u crimson_asi_manager.py
+py -3 -u "%~dp0crimson_asi_manager.py"
