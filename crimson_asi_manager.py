@@ -25,6 +25,9 @@ import sys
 import tarfile
 import tempfile
 import time
+import urllib.error
+import urllib.request
+import uuid
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -47,6 +50,39 @@ STATE_FILE_NAME = "state.json"
 ASIBAK_DIR_NAME = "asibak"
 CONFLICT_BACKUP_DIR_NAME = "asimanager_conflict_backups"
 DUPLICATE_BACKUP_DIR_NAME = "asiduplicates"
+LOADER_ARCHIVE_NAME = "asi_loaders_archive.zip"
+UASI_RELEASES_API = "https://api.github.com/repos/ThirteenAG/Ultimate-ASI-Loader/releases"
+UASI_ACTIVE_DLL_NAMES_X64 = [
+    "dinput8.dll",
+    "dsound.dll",
+    "version.dll",
+    "winmm.dll",
+    "winhttp.dll",
+    "wininet.dll",
+    "d3d9.dll",
+    "d3d10.dll",
+    "d3d11.dll",
+    "d3d12.dll",
+    "binkw64.dll",
+    "bink2w64.dll",
+    "xinput1_1.dll",
+    "xinput1_2.dll",
+    "xinput1_3.dll",
+    "xinput1_4.dll",
+    "xinput9_1_0.dll",
+    "xinputuap.dll",
+]
+UASI_KNOWN_DLL_NAMES = set(UASI_ACTIVE_DLL_NAMES_X64) | {
+    "d3d8.dll",
+    "ddraw.dll",
+    "dinput.dll",
+    "msacm32.dll",
+    "msvfw32.dll",
+    "xlive.dll",
+    "binkw32.dll",
+    "bink2w32.dll",
+    "vorbisfile.dll",
+}
 SUPPORTED_ARCHIVE_EXTS = {".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar"}
 IGNORED_TOP_NAMES = {
     STATE_DIR_NAME.lower(),
@@ -54,7 +90,7 @@ IGNORED_TOP_NAMES = {
     CONFLICT_BACKUP_DIR_NAME.lower(),
     DUPLICATE_BACKUP_DIR_NAME.lower(),
 }
-APP_VERSION = "v4-logging"
+APP_VERSION = "v5-loaders"
 
 
 def setup_logging() -> logging.Logger:
@@ -204,9 +240,17 @@ class State:
 
     def _default(self) -> dict:
         return {
-            "version": 1,
+            "version": 2,
             "target_dir": str(self.target_dir),
             "mods": {},
+            "loader": {
+                "selected_name": "dinput8.dll",
+                "current_name": "",
+                "source": "",
+                "version": "",
+                "updated_at": "",
+                "archive": LOADER_ARCHIVE_NAME,
+            },
         }
 
     def _load(self) -> dict:
@@ -214,6 +258,13 @@ class State:
             try:
                 data = json.loads(self.state_path.read_text(encoding="utf-8"))
                 data.setdefault("mods", {})
+                loader = data.setdefault("loader", {})
+                loader.setdefault("selected_name", "dinput8.dll")
+                loader.setdefault("current_name", "")
+                loader.setdefault("source", "")
+                loader.setdefault("version", "")
+                loader.setdefault("updated_at", "")
+                loader.setdefault("archive", LOADER_ARCHIVE_NAME)
                 data["target_dir"] = str(self.target_dir)
                 return data
             except Exception:
@@ -238,6 +289,10 @@ class State:
 
     def enabled_path(self, rel: str) -> Path:
         return self.target_dir / rel
+
+    @property
+    def loader_archive_path(self) -> Path:
+        return self.manager_dir / LOADER_ARCHIVE_NAME
 
     def actual_path(self, mod_id: str, rel: str) -> Path | None:
         enabled = self.enabled_path(rel)
@@ -298,6 +353,11 @@ class AsiManagerApp:
         self.target_var = StringVar(value="Папка ASI не выбрана")
         self.status_var = StringVar(value="Выберите папку игры или bin64.")
         self.show_disabled_var = BooleanVar(value=True)
+        self.loader_name_var = StringVar(value="dinput8.dll")
+        self.github_version_var = StringVar(value="")
+        self.loader_status_var = StringVar(value="Загрузчик: папка не выбрана")
+        self.github_releases: list[dict] = []
+        self._last_loader_warning_key: tuple[str, ...] | None = None
         self._sort_reverse: dict[tuple[int, str], bool] = {}
 
         LOGGER.info("Запуск %s %s. Drag-and-drop: %s", APP_NAME, APP_VERSION, "доступен" if DND_AVAILABLE else "недоступен")
@@ -363,6 +423,35 @@ class AsiManagerApp:
         self.mods_tree.pack(fill=BOTH, expand=True)
         self.mods_tree.bind("<<TreeviewSelect>>", self.on_mod_selected)
         self.mods_tree.bind("<Double-1>", lambda _e: self.toggle_selected_mod())
+
+        self.loader_frame = ttk.LabelFrame(right, text="Ultimate ASI Loader")
+        self.loader_frame.pack(fill=X, pady=(0, 8))
+        loader_row1 = ttk.Frame(self.loader_frame)
+        loader_row1.pack(fill=X, padx=6, pady=(6, 3))
+        ttk.Label(loader_row1, text="DLL:").pack(side=LEFT)
+        self.loader_combo = ttk.Combobox(
+            loader_row1,
+            textvariable=self.loader_name_var,
+            values=UASI_ACTIVE_DLL_NAMES_X64,
+            state="readonly",
+            width=18,
+        )
+        self.loader_combo.pack(side=LEFT, padx=(6, 8))
+        self.loader_combo.bind("<<ComboboxSelected>>", self.on_loader_choice_changed)
+        ttk.Button(loader_row1, text="Применить", command=self.apply_selected_loader).pack(side=LEFT)
+        ttk.Button(loader_row1, text="Добавить локальный", command=self.add_loader_via_dialog).pack(side=LEFT, padx=(6, 0))
+        ttk.Button(loader_row1, text="Папка", command=self.add_loader_folder_via_dialog).pack(side=LEFT, padx=(6, 0))
+        ttk.Button(loader_row1, text="В архив лишние", command=self.archive_extra_loaders).pack(side=LEFT, padx=(6, 0))
+
+        loader_row2 = ttk.Frame(self.loader_frame)
+        loader_row2.pack(fill=X, padx=6, pady=(3, 6))
+        ttk.Label(loader_row2, text="GitHub версия:").pack(side=LEFT)
+        self.github_combo = ttk.Combobox(loader_row2, textvariable=self.github_version_var, values=[], state="readonly", width=18)
+        self.github_combo.pack(side=LEFT, padx=(6, 8))
+        ttk.Button(loader_row2, text="Обновить список", command=self.refresh_github_releases).pack(side=LEFT)
+        ttk.Button(loader_row2, text="Скачать и поставить", command=self.download_selected_loader_from_github).pack(side=LEFT, padx=(6, 0))
+        self.loader_status_label = ttk.Label(self.loader_frame, textvariable=self.loader_status_var, wraplength=580)
+        self.loader_status_label.pack(fill=X, padx=6, pady=(0, 6))
 
         right_top = ttk.Frame(right)
         right_top.pack(fill=X, pady=(0, 6))
@@ -451,6 +540,16 @@ class AsiManagerApp:
         mod_menu.add_command(label="Открыть выбранный файл", command=self.open_selected_file)
         mod_menu.add_command(label="Сохранить заметку", command=self.save_note)
         menu.add_cascade(label="Мод", menu=mod_menu)
+
+        loader_menu = tk.Menu(menu, tearoff=False)
+        loader_menu.add_command(label="Добавить загрузчик из файла/архива...", command=self.add_loader_via_dialog)
+        loader_menu.add_command(label="Добавить загрузчик из папки...", command=self.add_loader_folder_via_dialog)
+        loader_menu.add_command(label="Применить выбранный загрузчик", command=self.apply_selected_loader)
+        loader_menu.add_command(label="Заархивировать лишние загрузчики", command=self.archive_extra_loaders)
+        loader_menu.add_separator()
+        loader_menu.add_command(label="Обновить список версий GitHub", command=self.refresh_github_releases)
+        loader_menu.add_command(label="Скачать выбранную версию с GitHub", command=self.download_selected_loader_from_github)
+        menu.add_cascade(label="Загрузчик", menu=loader_menu)
         self.root.config(menu=menu)
 
     def _register_dnd(self) -> None:
@@ -463,8 +562,19 @@ class AsiManagerApp:
             self.mods_tree.dnd_bind("<<Drop>>", self.on_drop)
             self.files_tree.drop_target_register(DND_FILES)
             self.files_tree.dnd_bind("<<Drop>>", self.on_drop)
+            for widget in self._walk_widgets(self.loader_frame):
+                try:
+                    widget.drop_target_register(DND_FILES)
+                    widget.dnd_bind("<<Drop>>", self.on_loader_drop)
+                except Exception:
+                    pass
         except Exception:
             pass
+
+    def _walk_widgets(self, widget):  # noqa: ANN001
+        yield widget
+        for child in widget.winfo_children():
+            yield from self._walk_widgets(child)
 
     def _load_last_target(self) -> None:
         settings = load_app_settings()
@@ -483,10 +593,15 @@ class AsiManagerApp:
         target.mkdir(parents=True, exist_ok=True)
         LOGGER.info("Выбрана рабочая папка ASI: %s", target)
         self.state = State(target)
+        loader_state = self.state.data.setdefault("loader", {})
+        selected_loader = str(loader_state.get("selected_name") or "dinput8.dll").lower()
+        if selected_loader in UASI_KNOWN_DLL_NAMES:
+            self.loader_name_var.set(selected_loader)
         self._cleanup_old_unpacked_duplicate_backups()
         self.target_var.set(str(target))
         save_app_settings({"target_dir": str(target)})
         self.rescan(silent=True)
+        self.refresh_loader_status(show_warning=True)
         self.status_var.set(f"Рабочая папка: {target}")
 
     def choose_target_dir(self) -> None:
@@ -509,18 +624,29 @@ class AsiManagerApp:
             LOGGER.info("Добавление через диалог: %s", "; ".join(paths))
             self.install_paths([Path(p) for p in paths])
 
-    def on_drop(self, event) -> None:  # noqa: ANN001
-        state = self.require_state()
-        if not state:
-            return
+    def _paths_from_drop_event(self, event) -> list[Path]:  # noqa: ANN001
         raw = event.data
         try:
             parts = self.root.tk.splitlist(raw)
         except Exception:
             parts = raw.split()
-        paths = [Path(p) for p in parts if p]
+        return [Path(p) for p in parts if p]
+
+    def on_drop(self, event) -> None:  # noqa: ANN001
+        state = self.require_state()
+        if not state:
+            return
+        paths = self._paths_from_drop_event(event)
         LOGGER.info("Добавление drag-and-drop: %s", "; ".join(str(p) for p in paths))
         self.install_paths(paths)
+
+    def on_loader_drop(self, event) -> None:  # noqa: ANN001
+        state = self.require_state()
+        if not state:
+            return
+        paths = self._paths_from_drop_event(event)
+        LOGGER.info("Добавление загрузчика drag-and-drop: %s", "; ".join(str(p) for p in paths))
+        self.install_loader_paths(paths)
 
     def install_paths(self, paths: list[Path]) -> None:
         state = self.require_state()
@@ -546,6 +672,397 @@ class AsiManagerApp:
             messagebox.showwarning(APP_NAME, msg)
         LOGGER.info(msg)
         self.status_var.set(msg)
+
+    def on_loader_choice_changed(self, _event=None) -> None:  # noqa: ANN001
+        selected = self.loader_name_var.get().strip().lower()
+        if selected not in UASI_KNOWN_DLL_NAMES:
+            selected = "dinput8.dll"
+            self.loader_name_var.set(selected)
+        state = self.state
+        if state:
+            state.data.setdefault("loader", {})["selected_name"] = selected
+            state.save()
+        LOGGER.info("Выбран тип ASI-загрузчика: %s", selected)
+        self.refresh_loader_status(show_warning=False)
+
+    def add_loader_via_dialog(self) -> None:
+        state = self.require_state()
+        if not state:
+            return
+        paths = filedialog.askopenfilenames(
+            title="Выберите DLL или архив Ultimate ASI Loader",
+            filetypes=(
+                ("Загрузчики и архивы", "*.dll *.zip *.7z *.rar *.tar *.gz *.tgz"),
+                ("Все файлы", "*.*"),
+            ),
+        )
+        if paths:
+            self.install_loader_paths([Path(p) for p in paths])
+
+    def add_loader_folder_via_dialog(self) -> None:
+        state = self.require_state()
+        if not state:
+            return
+        selected = filedialog.askdirectory(title="Выберите папку с DLL Ultimate ASI Loader")
+        if selected:
+            self.install_loader_paths([Path(selected)])
+
+    def install_loader_paths(self, paths: list[Path]) -> None:
+        state = self.require_state()
+        if not state:
+            return
+        installed = 0
+        errors: list[str] = []
+        for path in paths:
+            try:
+                if not path.exists():
+                    errors.append(f"Не найдено: {path}")
+                    continue
+                self._install_loader_one(path, f"local:{path}")
+                installed += 1
+            except Exception as exc:
+                LOGGER.exception("Ошибка установки ASI-загрузчика %s", path)
+                errors.append(f"{path}: {exc}")
+        self.refresh_loader_status(show_warning=True)
+        msg = f"Установлено загрузчиков: {installed}."
+        if errors:
+            msg += " Ошибки: " + "; ".join(errors[:4])
+            messagebox.showwarning(APP_NAME, msg)
+        LOGGER.info(msg)
+        self.status_var.set(msg)
+
+    def _install_loader_one(self, source: Path, source_label: str) -> None:
+        LOGGER.info("Обработка ASI-загрузчика: %s", source)
+        if source.is_dir():
+            self._install_loader_from_folder(source, source_label)
+            return
+        if source.suffix.lower() == ".dll":
+            self._install_loader_file(source, source_label=source_label, version="")
+            return
+        name = source.name.lower()
+        if source.suffix.lower() in SUPPORTED_ARCHIVE_EXTS or name.endswith((".tar.gz", ".tar.bz2", ".tar.xz")):
+            self._install_loader_from_archive(source, source_label)
+            return
+        raise RuntimeError("Нужен .dll, архив или папка с DLL загрузчика.")
+
+    def _install_loader_from_archive(self, archive: Path, source_label: str, version: str = "") -> None:
+        with tempfile.TemporaryDirectory(prefix="crimson_asi_loader_") as tmp_str:
+            tmp = Path(tmp_str)
+            LOGGER.info("Распаковка архива загрузчика: %s", archive)
+            self._unpack_archive(archive, tmp)
+            self._install_loader_from_folder(tmp, source_label, version=version)
+
+    def _install_loader_from_folder(self, folder: Path, source_label: str, version: str = "") -> None:
+        candidates = [p for p in folder.rglob("*.dll") if p.is_file()]
+        if not candidates:
+            raise RuntimeError("В папке/архиве не найдено DLL-файлов загрузчика.")
+        selected_name = self.loader_name_var.get().strip().lower()
+        source_dll = self._choose_loader_dll(candidates, selected_name)
+        self._install_loader_file(source_dll, source_label=source_label, version=version)
+
+    def _choose_loader_dll(self, candidates: list[Path], selected_name: str) -> Path:
+        selected_name = selected_name.lower()
+        exact = [p for p in candidates if p.name.lower() == selected_name]
+        if exact:
+            return exact[0]
+        known = [p for p in candidates if p.name.lower() in UASI_KNOWN_DLL_NAMES]
+        if len(candidates) > 1:
+            names = ", ".join(sorted(p.name for p in candidates)[:12])
+            LOGGER.warning("В источнике несколько DLL загрузчика: %s. Будет использован первый подходящий.", names)
+            messagebox.showwarning(
+                APP_NAME,
+                "В источнике несколько DLL. Менеджер возьмёт первую подходящую и переименует её в выбранный тип загрузчика.\n\n"
+                f"Выбранный тип: {selected_name}\nНайдено: {names}",
+            )
+        if known:
+            return known[0]
+        return candidates[0]
+
+    def _install_loader_file(self, source_dll: Path, source_label: str, version: str = "") -> None:
+        state = self.require_state()
+        if not state:
+            return
+        selected_name = self.loader_name_var.get().strip().lower() or "dinput8.dll"
+        if selected_name not in UASI_KNOWN_DLL_NAMES:
+            raise RuntimeError(f"Неподдерживаемое имя загрузчика: {selected_name}")
+        target = state.target_dir / selected_name
+        LOGGER.info("Установка ASI-загрузчика %s как %s", source_dll, target)
+
+        same_file = False
+        try:
+            same_file = source_dll.resolve() == target.resolve() or source_dll.samefile(target)
+        except Exception:
+            same_file = False
+
+        # Если источник лежит прямо в bin64 под другим именем, его может удалить архивация лишних.
+        # Поэтому заранее делаем временную копию. Файлы, как выяснилось, не любят исчезать до копирования.
+        temp_holder = None
+        copy_source = source_dll
+        if not same_file:
+            temp_holder = tempfile.TemporaryDirectory(prefix="crimson_asi_loader_copy_")
+            copy_source = Path(temp_holder.name) / source_dll.name
+            shutil.copy2(source_dll, copy_source)
+
+        try:
+            self._archive_other_loader_candidates(keep_name=selected_name)
+            if target.exists() and not same_file:
+                self._archive_loader_file(target, reason="replace_selected_loader")
+            if not same_file:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(copy_source, target)
+        finally:
+            if temp_holder is not None:
+                temp_holder.cleanup()
+        loader_state = state.data.setdefault("loader", {})
+        loader_state["selected_name"] = selected_name
+        loader_state["current_name"] = selected_name
+        loader_state["source"] = source_label
+        loader_state["version"] = version
+        loader_state["updated_at"] = now_iso()
+        loader_state["archive"] = LOADER_ARCHIVE_NAME
+        state.save()
+        LOGGER.info("ASI-загрузчик установлен: %s", target)
+        self.refresh_loader_status(show_warning=True)
+        self.status_var.set(f"Установлен ASI-загрузчик: {selected_name}")
+
+    def _detect_loader_candidates(self) -> list[Path]:
+        state = self.state
+        if not state:
+            return []
+        result: list[Path] = []
+        for path in state.target_dir.iterdir():
+            if not path.is_file():
+                continue
+            if path.name.lower() in UASI_KNOWN_DLL_NAMES:
+                result.append(path)
+        return sorted(result, key=lambda p: p.name.lower())
+
+    def refresh_loader_status(self, show_warning: bool = False) -> None:
+        state = self.state
+        if not state:
+            self.loader_status_var.set("Загрузчик: папка не выбрана")
+            return
+        selected = self.loader_name_var.get().strip().lower()
+        candidates = self._detect_loader_candidates()
+        names = [p.name for p in candidates]
+        active = [p for p in candidates if p.name.lower() == selected]
+        extras = [p for p in candidates if p.name.lower() != selected]
+        archive_note = ""
+        if state.loader_archive_path.exists():
+            try:
+                archive_note = f" | архив: {state.loader_archive_path.name} ({state.loader_archive_path.stat().st_size // 1024} КБ)"
+            except OSError:
+                archive_note = f" | архив: {state.loader_archive_path.name}"
+        if not candidates:
+            text = f"Текущий загрузчик: не найден. Выбран для установки: {selected}{archive_note}"
+        elif active and not extras:
+            text = f"Текущий загрузчик: {selected}{archive_note}"
+        elif active and extras:
+            text = f"Текущий: {selected}. Лишние в bin64: {', '.join(p.name for p in extras)}{archive_note}"
+        else:
+            text = f"Выбранный {selected} не найден. В bin64 есть: {', '.join(names)}{archive_note}"
+        self.loader_status_var.set(text)
+        try:
+            self.loader_status_label.configure(foreground=("red" if len(candidates) > 1 or (candidates and not active) else ""))
+        except Exception:
+            pass
+
+        key = tuple(p.name.lower() for p in candidates)
+        if show_warning and len(candidates) > 1 and key != self._last_loader_warning_key:
+            self._last_loader_warning_key = key
+            messagebox.showwarning(
+                APP_NAME,
+                "В bin64 найдено несколько DLL с именами, которые использует Ultimate ASI Loader.\n\n"
+                f"Выбранный: {selected}\nНайдено: {', '.join(names)}\n\n"
+                "Оставь один активный загрузчик. Кнопка 'В архив лишние' уберёт остальные в ZIP-архив менеджера.",
+            )
+
+    def _archive_loader_file(self, path: Path, reason: str) -> None:
+        state = self.require_state()
+        if not state:
+            return
+        if not path.exists() or not path.is_file():
+            return
+        archive_path = state.loader_archive_path
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        unique = uuid.uuid4().hex[:8]
+        safe_reason = slug(reason)
+        arc_dir = f"{stamp}_{safe_reason}_{unique}"
+        arc_name = f"{arc_dir}/{path.name}"
+        info_name = f"{arc_dir}/_loader_info.json"
+        info = {
+            "file": path.name,
+            "archived_at": now_iso(),
+            "reason": reason,
+            "original_path": str(path),
+            "size": path.stat().st_size,
+        }
+        LOGGER.info("Архивация загрузчика: %s -> %s:%s", path, archive_path, arc_name)
+        with zipfile.ZipFile(archive_path, "a", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.write(path, arc_name)
+            zf.writestr(info_name, json.dumps(info, ensure_ascii=False, indent=2))
+        path.unlink()
+        LOGGER.info("Загрузчик заархивирован и удалён из bin64: %s", path)
+
+    def _archive_other_loader_candidates(self, keep_name: str) -> int:
+        keep_name = keep_name.lower()
+        count = 0
+        for path in self._detect_loader_candidates():
+            if path.name.lower() == keep_name:
+                continue
+            self._archive_loader_file(path, reason=f"extra_loader_keep_{keep_name}")
+            count += 1
+        return count
+
+    def archive_extra_loaders(self) -> None:
+        state = self.require_state()
+        if not state:
+            return
+        selected = self.loader_name_var.get().strip().lower()
+        count = self._archive_other_loader_candidates(keep_name=selected)
+        state.save()
+        self.refresh_loader_status(show_warning=False)
+        self.status_var.set(f"Заархивировано лишних загрузчиков: {count}.")
+        LOGGER.info("Заархивировано лишних загрузчиков: %d", count)
+
+    def apply_selected_loader(self) -> None:
+        state = self.require_state()
+        if not state:
+            return
+        selected = self.loader_name_var.get().strip().lower()
+        active = state.target_dir / selected
+        if active.exists():
+            archived = self._archive_other_loader_candidates(keep_name=selected)
+            state.data.setdefault("loader", {})["selected_name"] = selected
+            state.data.setdefault("loader", {})["current_name"] = selected
+            state.data.setdefault("loader", {})["updated_at"] = now_iso()
+            state.save()
+            self.refresh_loader_status(show_warning=False)
+            self.status_var.set(f"Активен загрузчик: {selected}. Заархивировано лишних: {archived}.")
+            return
+        restored = self._restore_loader_from_archive(selected)
+        if restored:
+            self.status_var.set(f"Восстановлен загрузчик из архива: {selected}")
+            return
+        messagebox.showinfo(
+            APP_NAME,
+            f"В bin64 и архиве менеджера нет {selected}. Добавь локальный DLL/архив или скачай версию с GitHub.",
+        )
+
+    def _restore_loader_from_archive(self, selected_name: str) -> bool:
+        state = self.require_state()
+        if not state:
+            return False
+        archive_path = state.loader_archive_path
+        if not archive_path.exists():
+            return False
+        selected_name = selected_name.lower()
+        with tempfile.TemporaryDirectory(prefix="crimson_asi_loader_restore_") as tmp_str:
+            tmp = Path(tmp_str)
+            with zipfile.ZipFile(archive_path, "r") as zf:
+                match = None
+                for info in reversed(zf.infolist()):
+                    if info.is_dir():
+                        continue
+                    if Path(info.filename).name.lower() == selected_name:
+                        match = info
+                        break
+                if not match:
+                    return False
+                extracted = Path(zf.extract(match, tmp))
+            self._install_loader_file(extracted, source_label=f"archive:{archive_path.name}", version="")
+        return True
+
+    def refresh_github_releases(self) -> None:
+        self.status_var.set("Запрос списка версий Ultimate ASI Loader с GitHub...")
+        self.root.update_idletasks()
+        LOGGER.info("Запрос релизов GitHub: %s", UASI_RELEASES_API)
+        try:
+            req = urllib.request.Request(UASI_RELEASES_API, headers={"User-Agent": "CrimsonASIManager"})
+            with urllib.request.urlopen(req, timeout=20) as response:
+                payload = response.read().decode("utf-8")
+            releases = json.loads(payload)
+        except Exception as exc:
+            LOGGER.exception("Не удалось получить список релизов GitHub")
+            messagebox.showerror(APP_NAME, f"Не удалось получить список релизов GitHub:\n{exc}")
+            self.status_var.set("Не удалось получить список релизов GitHub.")
+            return
+        parsed: list[dict] = []
+        for release in releases:
+            tag = str(release.get("tag_name") or release.get("name") or "").strip()
+            if not tag:
+                continue
+            assets = []
+            for asset in release.get("assets", []) or []:
+                name = str(asset.get("name") or "")
+                url = str(asset.get("browser_download_url") or "")
+                if name.lower().endswith(".zip") and url:
+                    assets.append({"name": name, "url": url})
+            if assets:
+                parsed.append({"tag": tag, "name": release.get("name") or tag, "assets": assets})
+        self.github_releases = parsed
+        tags = [item["tag"] for item in parsed]
+        self.github_combo.configure(values=tags)
+        if tags and not self.github_version_var.get():
+            self.github_version_var.set(tags[0])
+        self.status_var.set(f"Найдено версий GitHub: {len(tags)}.")
+        LOGGER.info("Найдено релизов GitHub с ZIP-ассетами: %d", len(tags))
+
+    def _selected_github_release(self) -> dict | None:
+        tag = self.github_version_var.get().strip()
+        for release in self.github_releases:
+            if release.get("tag") == tag:
+                return release
+        return self.github_releases[0] if self.github_releases else None
+
+    @staticmethod
+    def _preferred_x64_asset(release: dict) -> dict | None:
+        assets = release.get("assets", []) or []
+        if not assets:
+            return None
+        for asset in assets:
+            if str(asset.get("name", "")).lower() == "ultimate-asi-loader_x64.zip":
+                return asset
+        for asset in assets:
+            if "x64" in str(asset.get("name", "")).lower():
+                return asset
+        return assets[0]
+
+    def download_selected_loader_from_github(self) -> None:
+        state = self.require_state()
+        if not state:
+            return
+        if not self.github_releases:
+            self.refresh_github_releases()
+        release = self._selected_github_release()
+        if not release:
+            messagebox.showerror(APP_NAME, "Список релизов GitHub пуст.")
+            return
+        asset = self._preferred_x64_asset(release)
+        if not asset:
+            messagebox.showerror(APP_NAME, "У выбранного релиза нет ZIP-ассета.")
+            return
+        tag = str(release.get("tag", ""))
+        asset_name = str(asset.get("name", "Ultimate-ASI-Loader_x64.zip"))
+        url = str(asset.get("url", ""))
+        self.status_var.set(f"Скачивание {asset_name} {tag}...")
+        self.root.update_idletasks()
+        LOGGER.info("Скачивание ASI-загрузчика с GitHub: %s %s", tag, url)
+        try:
+            with tempfile.TemporaryDirectory(prefix="crimson_asi_loader_dl_") as tmp_str:
+                tmp = Path(tmp_str)
+                archive = tmp / asset_name
+                req = urllib.request.Request(url, headers={"User-Agent": "CrimsonASIManager"})
+                with urllib.request.urlopen(req, timeout=60) as response:
+                    archive.write_bytes(response.read())
+                self._install_loader_from_archive(archive, source_label=f"github:{tag}:{asset_name}", version=tag)
+        except Exception as exc:
+            LOGGER.exception("Не удалось скачать/установить ASI-загрузчик с GitHub")
+            messagebox.showerror(APP_NAME, f"Не удалось скачать/установить загрузчик:\n{exc}")
+            self.status_var.set("Не удалось скачать/установить ASI-загрузчик.")
+            return
+        self.status_var.set(f"Скачан и установлен ASI-загрузчик {self.loader_name_var.get()} из {tag}.")
 
     def _install_one(self, source: Path) -> int:
         LOGGER.info("Обработка источника: %s", source)
@@ -831,6 +1348,7 @@ class AsiManagerApp:
         state.save()
         LOGGER.info("Сканирование завершено. Новых ASI-модов: %d", found)
         self.refresh_mods()
+        self.refresh_loader_status(show_warning=not silent)
         if not silent:
             self.status_var.set(f"Сканирование завершено. Найдено новых ASI-модов: {found}.")
 
