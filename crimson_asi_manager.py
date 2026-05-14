@@ -448,7 +448,7 @@ class AsiManagerApp:
         ttk.Label(loader_row2, text="GitHub версия:").pack(side=LEFT)
         self.github_combo = ttk.Combobox(loader_row2, textvariable=self.github_version_var, values=[], state="readonly", width=18)
         self.github_combo.pack(side=LEFT, padx=(6, 8))
-        ttk.Button(loader_row2, text="Обновить список", command=self.refresh_github_releases).pack(side=LEFT)
+        ttk.Button(loader_row2, text="Обновить", command=self.refresh_github_releases).pack(side=LEFT)
         ttk.Button(loader_row2, text="Скачать и поставить", command=self.download_selected_loader_from_github).pack(side=LEFT, padx=(6, 0))
         self.loader_status_label = ttk.Label(self.loader_frame, textvariable=self.loader_status_var, wraplength=580)
         self.loader_status_label.pack(fill=X, padx=6, pady=(0, 6))
