@@ -9,7 +9,8 @@ Crimson Desert ASI Manager
   - Python 3.10+
   - tkinter входит в обычную сборку Python для Windows
   - необязательно: pip install tkinterdnd2 для drag-and-drop
-  - необязательно: 7-Zip в PATH для .7z/.rar архивов
+  - .7z поддерживается через встроенный py7zr в EXE-сборке или через найденный 7-Zip
+  - .rar поддерживается через найденный 7-Zip без требования PATH
 """
 
 from __future__ import annotations
@@ -90,7 +91,7 @@ IGNORED_TOP_NAMES = {
     CONFLICT_BACKUP_DIR_NAME.lower(),
     DUPLICATE_BACKUP_DIR_NAME.lower(),
 }
-APP_VERSION = "v5-loaders"
+APP_VERSION = "v6-7zip-autodetect"
 
 
 def setup_logging() -> logging.Logger:
@@ -187,6 +188,106 @@ def save_app_settings(data: dict) -> None:
     path = app_settings_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def runtime_dir() -> Path:
+    """Папка, где лежит EXE при PyInstaller-сборке, или папка .py-файла при обычном запуске."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def _candidate_7zip_paths() -> list[Path]:
+    """Ищет 7-Zip там, где обычный пользователь реально его оставит.
+
+    PATH всё ещё поддерживается, но больше не является обязательным ритуалом.
+    """
+    settings = load_app_settings()
+    candidates: list[Path] = []
+
+    saved = str(settings.get("seven_zip_path", "")).strip()
+    if saved:
+        candidates.append(Path(saved))
+
+    env_path = os.environ.get("CRIMSON_ASI_MANAGER_7Z", "").strip()
+    if env_path:
+        candidates.append(Path(env_path))
+
+    for exe_name in ("7z", "7za", "7zz"):
+        found = shutil.which(exe_name)
+        if found:
+            candidates.append(Path(found))
+
+    base = runtime_dir()
+    candidates.extend([
+        base / "7z.exe",
+        base / "7za.exe",
+        base / "7zz.exe",
+        base / "7-Zip" / "7z.exe",
+        base / "7zip" / "7z.exe",
+        base / "tools" / "7zip" / "7z.exe",
+        base / "tools" / "7-Zip" / "7z.exe",
+    ])
+
+    for env_name in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        root = os.environ.get(env_name)
+        if not root:
+            continue
+        candidates.extend([
+            Path(root) / "7-Zip" / "7z.exe",
+            Path(root) / "Programs" / "7-Zip" / "7z.exe",
+        ])
+
+    # Убираем дубликаты без потери порядка.
+    result: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        key = str(path).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    return result
+
+
+def find_7zip_executable(parent: tk.Misc | None = None, ask_user: bool = False) -> str | None:
+    """Возвращает путь к 7z.exe/7za.exe/7zz.exe.
+
+    Сначала ищет автоматически: рядом с EXE, в tools\\7zip, в Program Files,
+    в сохранённом пользовательском пути и только потом в PATH. Если ask_user=True,
+    предлагает указать 7z.exe вручную и запоминает выбор.
+    """
+    for path in _candidate_7zip_paths():
+        try:
+            if path.exists() and path.is_file():
+                LOGGER.info("Найден 7-Zip: %s", path)
+                return str(path)
+        except OSError:
+            continue
+
+    if not ask_user:
+        LOGGER.warning("7-Zip не найден автоматически")
+        return None
+
+    selected = filedialog.askopenfilename(
+        parent=parent,
+        title="Укажите 7z.exe из папки 7-Zip",
+        filetypes=[("7-Zip executable", "7z.exe 7za.exe 7zz.exe"), ("Executable", "*.exe"), ("All files", "*.*")],
+    )
+    if not selected:
+        LOGGER.warning("Пользователь не выбрал 7-Zip")
+        return None
+
+    path = Path(selected)
+    if not path.exists() or not path.is_file():
+        LOGGER.warning("Выбранный путь 7-Zip не существует: %s", path)
+        return None
+
+    settings = load_app_settings()
+    settings["seven_zip_path"] = str(path)
+    save_app_settings(settings)
+    LOGGER.info("Сохранён путь к 7-Zip: %s", path)
+    return str(path)
 
 
 def detect_asi_target(selected: Path) -> Path:
@@ -448,7 +549,7 @@ class AsiManagerApp:
         ttk.Label(loader_row2, text="GitHub версия:").pack(side=LEFT)
         self.github_combo = ttk.Combobox(loader_row2, textvariable=self.github_version_var, values=[], state="readonly", width=18)
         self.github_combo.pack(side=LEFT, padx=(6, 8))
-        ttk.Button(loader_row2, text="Обновить", command=self.refresh_github_releases).pack(side=LEFT)
+        ttk.Button(loader_row2, text="Обновить список", command=self.refresh_github_releases).pack(side=LEFT)
         ttk.Button(loader_row2, text="Скачать и поставить", command=self.download_selected_loader_from_github).pack(side=LEFT, padx=(6, 0))
         self.loader_status_label = ttk.Label(self.loader_frame, textvariable=self.loader_status_var, wraplength=580)
         self.loader_status_label.pack(fill=X, padx=6, pady=(0, 6))
@@ -1094,11 +1195,40 @@ class AsiManagerApp:
             with tarfile.open(archive) as tf:
                 tf.extractall(destination)
             return
-        if name.endswith((".7z", ".rar")):
-            seven_zip = shutil.which("7z") or shutil.which("7za") or shutil.which("7zz")
-            LOGGER.info("Архив распознан как 7z/rar, используется внешний 7-Zip")
+        if name.endswith(".7z"):
+            seven_zip = find_7zip_executable(parent=self.root, ask_user=False)
+            if seven_zip:
+                LOGGER.info("Архив распознан как 7z, используется найденный 7-Zip: %s", seven_zip)
+                result = subprocess.run(
+                    [seven_zip, "x", "-y", f"-o{destination}", str(archive)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "7-Zip не распаковал архив")
+                return
+
+            try:
+                import py7zr  # type: ignore
+            except Exception:
+                py7zr = None
+
+            if py7zr is not None:
+                LOGGER.info("Архив распознан как 7z, используется встроенная библиотека py7zr")
+                with py7zr.SevenZipFile(archive, mode="r") as zf:
+                    zf.extractall(path=destination)
+                return
+
+            seven_zip = find_7zip_executable(parent=self.root, ask_user=True)
             if not seven_zip:
-                raise RuntimeError("Для .7z/.rar нужен установленный 7-Zip в PATH. ZIP работает без него.")
+                raise RuntimeError(
+                    "Не найден 7-Zip для .7z. Установите 7-Zip в обычное место "
+                    "C:\\Program Files\\7-Zip или положите 7z.exe рядом с CrimsonASIManager.exe "
+                    "либо в tools\\7zip. PATH больше не обязателен."
+                )
             result = subprocess.run(
                 [seven_zip, "x", "-y", f"-o{destination}", str(archive)],
                 stdout=subprocess.PIPE,
@@ -1109,6 +1239,27 @@ class AsiManagerApp:
             )
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "7-Zip не распаковал архив")
+            return
+
+        if name.endswith(".rar"):
+            seven_zip = find_7zip_executable(parent=self.root, ask_user=True)
+            LOGGER.info("Архив распознан как RAR, используется внешний 7-Zip: %s", seven_zip)
+            if not seven_zip:
+                raise RuntimeError(
+                    "Для .rar нужен 7-Zip, но PATH не нужен. Установите 7-Zip в обычное место "
+                    "C:\\Program Files\\7-Zip или положите 7z.exe рядом с CrimsonASIManager.exe "
+                    "либо в tools\\7zip."
+                )
+            result = subprocess.run(
+                [seven_zip, "x", "-y", f"-o{destination}", str(archive)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "7-Zip не распаковал RAR-архив")
             return
         try:
             shutil.unpack_archive(str(archive), str(destination))
