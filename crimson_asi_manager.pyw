@@ -91,7 +91,7 @@ IGNORED_TOP_NAMES = {
     CONFLICT_BACKUP_DIR_NAME.lower(),
     DUPLICATE_BACKUP_DIR_NAME.lower(),
 }
-APP_VERSION = "v6-7zip-autodetect"
+APP_VERSION = "v7-save-and-shader-folders"
 
 
 def setup_logging() -> logging.Logger:
@@ -331,6 +331,81 @@ def open_with_default_app(path: Path) -> None:
         subprocess.Popen(["xdg-open", str(path)])
 
 
+def local_appdata_dir() -> Path:
+    """Возвращает %LOCALAPPDATA% для Windows или домашнюю папку как безопасный fallback."""
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        return Path(local_appdata)
+    return Path.home() / "AppData" / "Local"
+
+
+def locallow_appdata_dir() -> Path:
+    local = local_appdata_dir()
+    # Обычно LocalLow лежит рядом с Local: AppData\LocalLow.
+    if local.name.lower() == "local":
+        return local.parent / "LocalLow"
+    return local / ".." / "LocalLow"
+
+
+def existing_paths(paths: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    result: list[Path] = []
+    for path in paths:
+        try:
+            resolved = str(path.expanduser().resolve())
+        except Exception:
+            resolved = str(path)
+        key = resolved.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if path.exists():
+            result.append(path)
+    return result
+
+
+def crimson_save_candidates() -> list[Path]:
+    """Известные варианты папки сохранений Crimson Desert на Windows.
+
+    У игры встречаются разные написания папок Pearl Abyss/PearlAbyss и CD/CrimsonDesert,
+    поэтому менеджер проверяет несколько вариантов, а не делает вид, что ПК пользователя
+    обязан совпадать с чужим гайдом из интернета.
+    """
+    local = local_appdata_dir()
+    return [
+        local / "Pearl Abyss" / "CD" / "save",
+        local / "PearlAbyss" / "CD" / "save",
+        local / "PearlAbyss" / "CrimsonDesert" / "SaveGames",
+        local / "Pearl Abyss" / "CrimsonDesert" / "SaveGames",
+        local / "CrimsonDesert" / "SaveGames",
+        local / "CrimsonDesert" / "Saved" / "SaveGames",
+        local / "Pearl Abyss" / "CD",
+        local / "PearlAbyss" / "CrimsonDesert",
+    ]
+
+
+def shader_cache_candidates() -> list[tuple[str, Path]]:
+    local = local_appdata_dir()
+    locallow = locallow_appdata_dir()
+    appdata = Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming"))
+    return [
+        ("NVIDIA DXCache", local / "NVIDIA" / "DXCache"),
+        ("NVIDIA PerDriverCache DXCache", local / "NVIDIA" / "PerDriverCache" / "DXCache"),
+        ("NVIDIA LocalLow DXCache", locallow / "NVIDIA" / "DXCache"),
+        ("NVIDIA LocalLow PerDriverVersion DXCache", locallow / "NVIDIA" / "PerDriverVersion" / "DXCache"),
+        ("NVIDIA ComputeCache", appdata / "NVIDIA" / "ComputeCache"),
+        ("AMD DXCache", local / "AMD" / "DXCache"),
+        ("AMD DxcCache", local / "AMD" / "DxcCache"),
+        ("AMD GLCache", local / "AMD" / "GLCache"),
+        ("AMD VkCache", local / "AMD" / "VkCache"),
+        ("Intel ShaderCache", local / "Intel" / "ShaderCache"),
+        ("Intel DXCache", local / "Intel" / "DXCache"),
+        ("Windows D3DSCache", local / "D3DSCache"),
+        ("Windows DirectX Shader Cache", local / "Microsoft" / "DirectX Shader Cache"),
+        ("Temp DXCache", local / "Temp" / "DXCache"),
+    ]
+
+
 class State:
     def __init__(self, target_dir: Path):
         self.target_dir = target_dir.resolve()
@@ -559,6 +634,8 @@ class AsiManagerApp:
         ttk.Button(right_top, text="Открыть выбранный файл", command=self.open_selected_file).pack(side=LEFT)
         ttk.Button(right_top, text="Открыть .ini", command=self.open_first_ini).pack(side=LEFT, padx=(6, 0))
         ttk.Button(right_top, text="Открыть папку", command=self.open_target_dir).pack(side=LEFT, padx=(6, 0))
+        ttk.Button(right_top, text="Сохранения", command=self.open_save_folder).pack(side=LEFT, padx=(6, 0))
+        ttk.Button(right_top, text="Кэш шейдеров", command=self.open_shader_cache_folder).pack(side=LEFT, padx=(6, 0))
         ttk.Button(right_top, text="Сохранить заметку", command=self.save_note).pack(side=RIGHT)
 
         self.files_tree = ttk.Treeview(right, columns=("file", "mtime", "place"), show="headings", selectmode="browse")
@@ -651,6 +728,16 @@ class AsiManagerApp:
         loader_menu.add_command(label="Обновить список версий GitHub", command=self.refresh_github_releases)
         loader_menu.add_command(label="Скачать выбранную версию с GitHub", command=self.download_selected_loader_from_github)
         menu.add_cascade(label="Загрузчик", menu=loader_menu)
+
+        tools_menu = tk.Menu(menu, tearoff=False)
+        tools_menu.add_command(label="Открыть папку сохранений", command=self.open_save_folder)
+        tools_menu.add_command(label="Открыть кэш шейдеров автоматически", command=self.open_shader_cache_folder)
+        tools_menu.add_separator()
+        tools_menu.add_command(label="Открыть NVIDIA DXCache", command=lambda: self.open_shader_cache_folder("nvidia"))
+        tools_menu.add_command(label="Открыть AMD DXCache", command=lambda: self.open_shader_cache_folder("amd"))
+        tools_menu.add_command(label="Открыть Intel ShaderCache", command=lambda: self.open_shader_cache_folder("intel"))
+        tools_menu.add_command(label="Открыть Windows D3DSCache", command=lambda: self.open_shader_cache_folder("windows"))
+        menu.add_cascade(label="Инструменты", menu=tools_menu)
         self.root.config(menu=menu)
 
     def _register_dnd(self) -> None:
@@ -1704,6 +1791,83 @@ class AsiManagerApp:
         except Exception as exc:
             LOGGER.exception("Ошибка открытия рабочей папки %s", state.target_dir)
             messagebox.showerror(APP_NAME, str(exc))
+
+    def open_save_folder(self) -> None:
+        """Открывает папку сохранений Crimson Desert, если она найдена."""
+        candidates = crimson_save_candidates()
+        found = existing_paths(candidates)
+        if found:
+            target = found[0]
+            try:
+                LOGGER.info("Открытие папки сохранений: %s", target)
+                open_with_default_app(target)
+                self.status_var.set(f"Открыта папка сохранений: {target}")
+                return
+            except Exception as exc:
+                LOGGER.exception("Ошибка открытия папки сохранений %s", target)
+                messagebox.showerror(APP_NAME, str(exc))
+                return
+
+        local = local_appdata_dir()
+        message = (
+            "Папка сохранений Crimson Desert не найдена.\n\n"
+            "Проверялись варианты:\n"
+            + "\n".join(f"• {p}" for p in candidates[:6])
+            + "\n\nОткрою %LOCALAPPDATA%, чтобы можно было найти папку вручную."
+        )
+        LOGGER.warning("Папка сохранений не найдена. Открываю LOCALAPPDATA: %s", local)
+        messagebox.showwarning(APP_NAME, message)
+        try:
+            open_with_default_app(local)
+        except Exception as exc:
+            LOGGER.exception("Ошибка открытия LOCALAPPDATA %s", local)
+            messagebox.showerror(APP_NAME, str(exc))
+
+    def open_shader_cache_folder(self, vendor: str = "auto") -> None:
+        """Открывает папку кэша шейдеров.
+
+        auto сначала пытается открыть NVIDIA DXCache, потому что это путь, который чаще всего
+        нужен для текущего запроса. Если NVIDIA нет, берёт AMD/Intel/системные варианты.
+        """
+        vendor = (vendor or "auto").lower()
+        all_candidates = shader_cache_candidates()
+        if vendor == "auto":
+            preferred = [item for item in all_candidates if item[0] == "NVIDIA DXCache"]
+            fallback = [item for item in all_candidates if item not in preferred]
+            candidates = preferred + fallback
+        elif vendor == "nvidia":
+            candidates = [item for item in all_candidates if item[0].lower().startswith("nvidia")]
+        elif vendor == "amd":
+            candidates = [item for item in all_candidates if item[0].lower().startswith("amd")]
+        elif vendor == "intel":
+            candidates = [item for item in all_candidates if item[0].lower().startswith("intel")]
+        elif vendor == "windows":
+            candidates = [item for item in all_candidates if item[0].lower().startswith("windows") or item[0].lower().startswith("temp")]
+        else:
+            candidates = all_candidates
+
+        for label, path in candidates:
+            if path.exists():
+                try:
+                    LOGGER.info("Открытие папки кэша шейдеров [%s]: %s", label, path)
+                    open_with_default_app(path)
+                    self.status_var.set(f"Открыт кэш шейдеров: {label} — {path}")
+                    return
+                except Exception as exc:
+                    LOGGER.exception("Ошибка открытия кэша шейдеров %s: %s", label, path)
+                    messagebox.showerror(APP_NAME, str(exc))
+                    return
+
+        # Для NVIDIA показываем именно тот путь, который ожидает пользователь, но папку не создаём.
+        display_candidates = candidates or all_candidates
+        message = (
+            "Подходящая папка кэша шейдеров не найдена.\n\n"
+            "Проверялись варианты:\n"
+            + "\n".join(f"• {label}: {path}" for label, path in display_candidates[:8])
+            + "\n\nПапку не создаю: если драйвер её не использует, пустая папка только создаст иллюзию порядка."
+        )
+        LOGGER.warning("Папка кэша шейдеров не найдена для режима %s", vendor)
+        messagebox.showwarning(APP_NAME, message)
 
     def run(self) -> None:
         self.root.mainloop()
