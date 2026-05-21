@@ -1,6 +1,8 @@
 # Crimson Desert ASI Manager
 ==========================
 
+<img width="1102" height="612" alt="image" src="https://github.com/user-attachments/assets/1f8501ce-9866-498a-817d-b4addb22abca" />
+
 ## RU
 Что делает:
 - Выбирает папку игры или bin64. Если выбрана папка игры и внутри есть bin64, использует bin64.
