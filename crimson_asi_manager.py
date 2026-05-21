@@ -91,7 +91,15 @@ IGNORED_TOP_NAMES = {
     CONFLICT_BACKUP_DIR_NAME.lower(),
     DUPLICATE_BACKUP_DIR_NAME.lower(),
 }
-APP_VERSION = "v7-save-and-shader-folders"
+APP_VERSION = "v9-delete-without-archives"
+SAVE_BACKUP_DIR_NAME = "save_backups"
+DELETED_MOD_BACKUP_DIR_NAME = "deleted_mods"
+GAME_PROCESS_NAMES = [
+    "CrimsonDesert.exe",
+    "CrimsonDesert-Win64-Shipping.exe",
+    "CrimsonDesertClient.exe",
+    "CD.exe",
+]
 
 
 def setup_logging() -> logging.Logger:
@@ -188,6 +196,12 @@ def save_app_settings(data: dict) -> None:
     path = app_settings_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def update_app_settings(**values) -> None:  # noqa: ANN003
+    data = load_app_settings()
+    data.update(values)
+    save_app_settings(data)
 
 
 def runtime_dir() -> Path:
@@ -470,6 +484,14 @@ class State:
     def loader_archive_path(self) -> Path:
         return self.manager_dir / LOADER_ARCHIVE_NAME
 
+    @property
+    def save_backup_dir(self) -> Path:
+        return self.manager_dir / SAVE_BACKUP_DIR_NAME
+
+    @property
+    def deleted_mod_backup_dir(self) -> Path:
+        return self.manager_dir / DELETED_MOD_BACKUP_DIR_NAME
+
     def actual_path(self, mod_id: str, rel: str) -> Path | None:
         enabled = self.enabled_path(rel)
         if enabled.exists():
@@ -532,23 +554,36 @@ class AsiManagerApp:
         self.loader_name_var = StringVar(value="dinput8.dll")
         self.github_version_var = StringVar(value="")
         self.loader_status_var = StringVar(value="Загрузчик: папка не выбрана")
+        settings = load_app_settings()
+        self.backup_saves_var = BooleanVar(value=bool(settings.get("backup_saves_enabled", False)))
+        self.backup_count_var = StringVar(value=str(settings.get("backup_saves_keep", 10)))
         self.github_releases: list[dict] = []
         self._last_loader_warning_key: tuple[str, ...] | None = None
         self._sort_reverse: dict[tuple[int, str], bool] = {}
+        self._game_was_running = False
+        self._monitor_after_id: str | None = None
+        self._last_save_backup_at = 0.0
 
         LOGGER.info("Запуск %s %s. Drag-and-drop: %s", APP_NAME, APP_VERSION, "доступен" if DND_AVAILABLE else "недоступен")
         self._build_ui()
         self._load_last_target()
         self._register_dnd()
+        self._schedule_game_monitor()
         self.root.protocol("WM_DELETE_WINDOW", self.close_app)
 
     def close_app(self) -> None:
         """Корректно закрывает окно и завершает процесс без зависшей bat-консоли."""
         LOGGER.info("Закрытие программы")
         try:
-            self.save_note()
+            self.save_note(silent=True)
         except Exception:
             pass
+        if self._monitor_after_id:
+            try:
+                self.root.after_cancel(self._monitor_after_id)
+            except Exception:
+                pass
+            self._monitor_after_id = None
         try:
             self.root.destroy()
         finally:
@@ -563,7 +598,10 @@ class AsiManagerApp:
         top.pack(fill=X)
         ttk.Label(top, text="Папка ASI:").pack(side=LEFT)
         ttk.Label(top, textvariable=self.target_var).pack(side=LEFT, padx=(6, 12))
-        ttk.Button(top, text="Выбрать папку игры/bin64", command=self.choose_target_dir).pack(side=RIGHT)
+        top_buttons = ttk.Frame(top)
+        top_buttons.pack(side=RIGHT)
+        ttk.Button(top_buttons, text="Выбрать папку игры/bin64", command=self.choose_target_dir).pack(side=LEFT)
+        ttk.Button(top_buttons, text="Открыть папку", command=self.open_target_dir).pack(side=LEFT, padx=(6, 0))
 
         main = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         main.pack(fill=BOTH, expand=True, padx=8, pady=4)
@@ -578,6 +616,7 @@ class AsiManagerApp:
         ttk.Button(toolbar, text="Добавить", command=self.add_via_dialog).pack(side=LEFT)
         ttk.Button(toolbar, text="Вкл/выкл", command=self.toggle_selected_mod).pack(side=LEFT, padx=(6, 0))
         ttk.Button(toolbar, text="Сканировать", command=self.rescan).pack(side=LEFT, padx=(6, 0))
+        ttk.Button(toolbar, text="Удалить", command=self.delete_selected_mod).pack(side=LEFT, padx=(6, 0))
         ttk.Checkbutton(toolbar, text="показывать отключенные", variable=self.show_disabled_var, command=self.refresh_mods).pack(side=RIGHT)
 
         self.mods_tree = ttk.Treeview(
@@ -615,9 +654,8 @@ class AsiManagerApp:
         self.loader_combo.pack(side=LEFT, padx=(6, 8))
         self.loader_combo.bind("<<ComboboxSelected>>", self.on_loader_choice_changed)
         ttk.Button(loader_row1, text="Применить", command=self.apply_selected_loader).pack(side=LEFT)
-        ttk.Button(loader_row1, text="Добавить локальный", command=self.add_loader_via_dialog).pack(side=LEFT, padx=(6, 0))
-        ttk.Button(loader_row1, text="Папка", command=self.add_loader_folder_via_dialog).pack(side=LEFT, padx=(6, 0))
-        ttk.Button(loader_row1, text="В архив лишние", command=self.archive_extra_loaders).pack(side=LEFT, padx=(6, 0))
+        ttk.Button(loader_row1, text="Добавить", command=self.add_loader_via_dialog).pack(side=LEFT, padx=(6, 0))
+        ttk.Button(loader_row1, text="Чистка", command=self.archive_extra_loaders).pack(side=LEFT, padx=(6, 0))
 
         loader_row2 = ttk.Frame(self.loader_frame)
         loader_row2.pack(fill=X, padx=6, pady=(3, 6))
@@ -631,12 +669,23 @@ class AsiManagerApp:
 
         right_top = ttk.Frame(right)
         right_top.pack(fill=X, pady=(0, 6))
-        ttk.Button(right_top, text="Открыть выбранный файл", command=self.open_selected_file).pack(side=LEFT)
-        ttk.Button(right_top, text="Открыть .ini", command=self.open_first_ini).pack(side=LEFT, padx=(6, 0))
-        ttk.Button(right_top, text="Открыть папку", command=self.open_target_dir).pack(side=LEFT, padx=(6, 0))
+        ttk.Button(right_top, text="Открыть .ini", command=self.open_first_ini).pack(side=LEFT)
         ttk.Button(right_top, text="Сохранения", command=self.open_save_folder).pack(side=LEFT, padx=(6, 0))
         ttk.Button(right_top, text="Кэш шейдеров", command=self.open_shader_cache_folder).pack(side=LEFT, padx=(6, 0))
-        ttk.Button(right_top, text="Сохранить заметку", command=self.save_note).pack(side=RIGHT)
+
+        backup_row = ttk.Frame(right)
+        backup_row.pack(fill=X, pady=(0, 6))
+        ttk.Checkbutton(
+            backup_row,
+            text="Бэкап сохранений после закрытия игры",
+            variable=self.backup_saves_var,
+            command=self.on_backup_settings_changed,
+        ).pack(side=LEFT)
+        ttk.Label(backup_row, text="хранить:").pack(side=LEFT, padx=(10, 4))
+        self.backup_count_spin = ttk.Spinbox(backup_row, from_=1, to=999, width=5, textvariable=self.backup_count_var, command=self.on_backup_settings_changed)
+        self.backup_count_spin.pack(side=LEFT)
+        self.backup_count_spin.bind("<FocusOut>", lambda _e: self.on_backup_settings_changed())
+        self.backup_count_spin.bind("<Return>", lambda _e: self.on_backup_settings_changed())
 
         self.files_tree = ttk.Treeview(right, columns=("file", "mtime", "place"), show="headings", selectmode="browse")
         self.files_tree.heading("file", text="Файл", command=lambda: self.sort_tree(self.files_tree, "file"))
@@ -650,6 +699,9 @@ class AsiManagerApp:
 
         notes_frame = ttk.LabelFrame(right, text="Заметка")
         notes_frame.pack(fill=BOTH, expand=False, pady=(8, 0))
+        notes_toolbar = ttk.Frame(notes_frame)
+        notes_toolbar.pack(fill=X, padx=6, pady=(6, 0))
+        ttk.Button(notes_toolbar, text="Сохранить заметку", command=self.save_note).pack(side=RIGHT)
         self.notes_text = tk.Text(notes_frame, height=7, wrap="word", undo=True)
         self.notes_text.pack(fill=BOTH, expand=True, padx=6, pady=6)
 
@@ -714,16 +766,15 @@ class AsiManagerApp:
 
         mod_menu = tk.Menu(menu, tearoff=False)
         mod_menu.add_command(label="Включить/отключить", command=self.toggle_selected_mod)
+        mod_menu.add_command(label="Удалить", command=self.delete_selected_mod)
         mod_menu.add_command(label="Открыть .ini", command=self.open_first_ini)
-        mod_menu.add_command(label="Открыть выбранный файл", command=self.open_selected_file)
         mod_menu.add_command(label="Сохранить заметку", command=self.save_note)
         menu.add_cascade(label="Мод", menu=mod_menu)
 
         loader_menu = tk.Menu(menu, tearoff=False)
         loader_menu.add_command(label="Добавить загрузчик из файла/архива...", command=self.add_loader_via_dialog)
-        loader_menu.add_command(label="Добавить загрузчик из папки...", command=self.add_loader_folder_via_dialog)
         loader_menu.add_command(label="Применить выбранный загрузчик", command=self.apply_selected_loader)
-        loader_menu.add_command(label="Заархивировать лишние загрузчики", command=self.archive_extra_loaders)
+        loader_menu.add_command(label="Чистка лишних загрузчиков", command=self.archive_extra_loaders)
         loader_menu.add_separator()
         loader_menu.add_command(label="Обновить список версий GitHub", command=self.refresh_github_releases)
         loader_menu.add_command(label="Скачать выбранную версию с GitHub", command=self.download_selected_loader_from_github)
@@ -731,6 +782,7 @@ class AsiManagerApp:
 
         tools_menu = tk.Menu(menu, tearoff=False)
         tools_menu.add_command(label="Открыть папку сохранений", command=self.open_save_folder)
+        tools_menu.add_command(label="Сделать бэкап сохранений сейчас", command=self.backup_crimson_saves_now)
         tools_menu.add_command(label="Открыть кэш шейдеров автоматически", command=self.open_shader_cache_folder)
         tools_menu.add_separator()
         tools_menu.add_command(label="Открыть NVIDIA DXCache", command=lambda: self.open_shader_cache_folder("nvidia"))
@@ -764,6 +816,158 @@ class AsiManagerApp:
         for child in widget.winfo_children():
             yield from self._walk_widgets(child)
 
+    def _backup_keep_count(self) -> int:
+        try:
+            value = int(str(self.backup_count_var.get()).strip())
+        except ValueError:
+            value = 10
+        value = max(1, min(999, value))
+        self.backup_count_var.set(str(value))
+        return value
+
+    def on_backup_settings_changed(self) -> None:
+        keep = self._backup_keep_count()
+        enabled = bool(self.backup_saves_var.get())
+        update_app_settings(backup_saves_enabled=enabled, backup_saves_keep=keep)
+        LOGGER.info("Настройки бэкапа сохранений: enabled=%s keep=%d", enabled, keep)
+        self.status_var.set(
+            f"Бэкап сохранений {'включён' if enabled else 'выключен'}. Хранить архивов: {keep}."
+        )
+
+    def _schedule_game_monitor(self) -> None:
+        try:
+            self._monitor_after_id = self.root.after(5000, self._monitor_game_for_save_backup)
+        except Exception:
+            self._monitor_after_id = None
+
+    def _monitor_game_for_save_backup(self) -> None:
+        try:
+            if not self.backup_saves_var.get():
+                self._game_was_running = False
+                return
+
+            running = self._is_crimson_desert_running()
+            if running and not self._game_was_running:
+                LOGGER.info("Обнаружен запуск Crimson Desert. Буду ждать закрытия для бэкапа сохранений.")
+                self.status_var.set("Игра запущена. После закрытия будет создан бэкап сохранений.")
+            if self._game_was_running and not running:
+                LOGGER.info("Crimson Desert закрыт. Запускаю бэкап сохранений.")
+                # Защита от двойного срабатывания, если tasklist на секунду вернул пустой результат.
+                if time.time() - self._last_save_backup_at > 30:
+                    self.backup_crimson_saves(reason="game_closed", show_messages=False)
+                    self._last_save_backup_at = time.time()
+            self._game_was_running = running
+        except Exception:
+            LOGGER.exception("Ошибка мониторинга процесса игры")
+        finally:
+            self._schedule_game_monitor()
+
+    @staticmethod
+    def _is_crimson_desert_running() -> bool:
+        if platform.system() != "Windows":
+            return False
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FO", "CSV", "/NH"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=creationflags,
+                timeout=5,
+            )
+        except Exception:
+            return False
+        output = result.stdout.lower()
+        if any(name.lower() in output for name in GAME_PROCESS_NAMES):
+            return True
+        return "crimson" in output and "desert" in output
+
+    @staticmethod
+    def _find_save_folder_for_backup() -> Path | None:
+        existing = existing_paths(crimson_save_candidates())
+        if not existing:
+            return None
+        preferred = [p for p in existing if p.name.lower() in {"save", "saves", "savegames"}]
+        if preferred:
+            return preferred[0]
+        return existing[0]
+
+    def backup_crimson_saves_now(self) -> None:
+        self.backup_crimson_saves(reason="manual", show_messages=True)
+
+    def backup_crimson_saves(self, reason: str = "manual", show_messages: bool = True) -> Path | None:
+        state = self.require_state()
+        if not state:
+            return None
+        save_dir = self._find_save_folder_for_backup()
+        if not save_dir or not save_dir.exists():
+            message = "Папка сохранений Crimson Desert не найдена. Бэкап не создан."
+            LOGGER.warning(message)
+            if show_messages:
+                messagebox.showwarning(APP_NAME, message)
+            self.status_var.set(message)
+            return None
+
+        files = [p for p in save_dir.rglob("*") if p.is_file()]
+        if not files:
+            message = f"Папка сохранений пуста: {save_dir}. Бэкап не создан."
+            LOGGER.warning(message)
+            if show_messages:
+                messagebox.showwarning(APP_NAME, message)
+            self.status_var.set(message)
+            return None
+
+        state.save_backup_dir.mkdir(parents=True, exist_ok=True)
+        archive_path = state.save_backup_dir / f"saves_{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
+        manifest = {
+            "created_at": now_iso(),
+            "reason": reason,
+            "source": str(save_dir),
+            "file_count": len(files),
+        }
+        LOGGER.info("Создание бэкапа сохранений: %s -> %s", save_dir, archive_path)
+        try:
+            with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for file in files:
+                    zf.write(file, normalize_rel(file.relative_to(save_dir)))
+                zf.writestr("_crimson_asi_manager_save_backup.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+        except Exception as exc:
+            LOGGER.exception("Ошибка создания бэкапа сохранений")
+            if archive_path.exists():
+                try:
+                    archive_path.unlink()
+                except Exception:
+                    pass
+            if show_messages:
+                messagebox.showerror(APP_NAME, f"Не удалось создать бэкап сохранений:\n{exc}")
+            self.status_var.set("Не удалось создать бэкап сохранений.")
+            return None
+
+        self._prune_save_backups(state)
+        message = f"Создан бэкап сохранений: {archive_path.name}"
+        LOGGER.info(message)
+        self.status_var.set(message)
+        if show_messages:
+            messagebox.showinfo(APP_NAME, message)
+        return archive_path
+
+    def _prune_save_backups(self, state: State) -> None:
+        keep = self._backup_keep_count()
+        archives = sorted(
+            state.save_backup_dir.glob("saves_*.zip"),
+            key=lambda p: p.stat().st_mtime if p.exists() else 0,
+            reverse=True,
+        )
+        for old in archives[keep:]:
+            try:
+                old.unlink()
+                LOGGER.info("Удалён старый бэкап сохранений по лимиту: %s", old)
+            except Exception:
+                LOGGER.exception("Не удалось удалить старый бэкап сохранений: %s", old)
+
     def _load_last_target(self) -> None:
         settings = load_app_settings()
         target = settings.get("target_dir")
@@ -787,7 +991,7 @@ class AsiManagerApp:
             self.loader_name_var.set(selected_loader)
         self._cleanup_old_unpacked_duplicate_backups()
         self.target_var.set(str(target))
-        save_app_settings({"target_dir": str(target)})
+        update_app_settings(target_dir=str(target))
         self.rescan(silent=True)
         self.refresh_loader_status(show_warning=True)
         self.status_var.set(f"Рабочая папка: {target}")
@@ -1062,7 +1266,7 @@ class AsiManagerApp:
                 APP_NAME,
                 "В bin64 найдено несколько DLL с именами, которые использует Ultimate ASI Loader.\n\n"
                 f"Выбранный: {selected}\nНайдено: {', '.join(names)}\n\n"
-                "Оставь один активный загрузчик. Кнопка 'В архив лишние' уберёт остальные в ZIP-архив менеджера.",
+                "Оставь один активный загрузчик. Кнопка 'Чистка' уберёт остальные в ZIP-архив менеджера.",
             )
 
     def _archive_loader_file(self, path: Path, reason: str) -> None:
@@ -1111,7 +1315,7 @@ class AsiManagerApp:
         count = self._archive_other_loader_candidates(keep_name=selected)
         state.save()
         self.refresh_loader_status(show_warning=False)
-        self.status_var.set(f"Заархивировано лишних загрузчиков: {count}.")
+        self.status_var.set(f"Чистка завершена. Заархивировано лишних загрузчиков: {count}.")
         LOGGER.info("Заархивировано лишних загрузчиков: %d", count)
 
     def apply_selected_loader(self) -> None:
@@ -1442,7 +1646,7 @@ class AsiManagerApp:
 
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         mod_name = safe_name(str(mod.get("name", mod_id)))
-        duplicate_dir = state.target_dir / DUPLICATE_BACKUP_DIR_NAME / f"{timestamp}_{mod_name}"
+        duplicate_dir = state.manager_dir / DUPLICATE_BACKUP_DIR_NAME / f"{timestamp}_{mod_name}"
         duplicate_dir.mkdir(parents=True, exist_ok=True)
         archive_path = duplicate_dir / "previous_files.zip"
 
@@ -1527,7 +1731,7 @@ class AsiManagerApp:
         owner = self._owner_of_rel(rel)
         if owner == mod_id:
             return
-        backup_root = state.target_dir / CONFLICT_BACKUP_DIR_NAME / datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_root = state.manager_dir / CONFLICT_BACKUP_DIR_NAME / datetime.now().strftime("%Y%m%d-%H%M%S")
         backup = backup_root / rel
         backup.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(target, backup)
@@ -1660,8 +1864,8 @@ class AsiManagerApp:
         self.notes_text.delete("1.0", END)
         self.notes_text.insert("1.0", mod.get("notes", ""))
 
-    def save_note(self) -> None:
-        state = self.require_state()
+    def save_note(self, silent: bool = False) -> None:
+        state = self.state
         if not state or not self.selected_mod_id:
             return
         mod = state.mods.get(self.selected_mod_id)
@@ -1670,7 +1874,8 @@ class AsiManagerApp:
         mod["notes"] = self.notes_text.get("1.0", END).rstrip("\n")
         mod["updated_at"] = now_iso()
         state.save()
-        self.status_var.set("Заметка сохранена.")
+        if not silent:
+            self.status_var.set("Заметка сохранена.")
 
     def toggle_selected_mod(self) -> None:
         state = self.require_state()
@@ -1736,6 +1941,61 @@ class AsiManagerApp:
         mod["updated_at"] = now_iso()
         LOGGER.info("Включено: %s. Возвращено файлов: %d", mod.get("name", mod_id), moved)
         self.status_var.set(f"Включено: {mod.get('name', mod_id)}. Возвращено файлов: {moved}.")
+
+    def delete_selected_mod(self) -> None:
+        state = self.require_state()
+        if not state or not self.selected_mod_id:
+            messagebox.showinfo(APP_NAME, "Выберите мод для удаления.")
+            return
+        mod_id = self.selected_mod_id
+        mod = state.mods.get(mod_id)
+        if not mod:
+            return
+        mod_name = str(mod.get("name", mod_id))
+        files_count = len(mod.get("files", []))
+        if not messagebox.askyesno(
+            APP_NAME,
+            f"Удалить мод «{mod_name}»?\n\n"
+            f"Будет удалено файлов: {files_count}.\n"
+            "Архивная копия НЕ создаётся. Действие нельзя отменить через менеджер.",
+        ):
+            return
+        try:
+            deleted_count = self._delete_mod_files(mod_id)
+            state.mods.pop(mod_id, None)
+            state.save()
+            self.selected_mod_id = None
+            self.refresh_mods()
+            self.status_var.set(f"Мод удалён: {mod_name}. Удалено файлов: {deleted_count}.")
+        except Exception as exc:
+            LOGGER.exception("Ошибка удаления мода %s", mod_id)
+            messagebox.showerror(APP_NAME, f"Не удалось удалить мод:\n{exc}")
+
+    def _delete_mod_files(self, mod_id: str) -> int:
+        """Удаляет файлы мода без создания ZIP-архива.
+
+        Отключенные файлы ищутся в asibak/<mod_id>/*.bak, включенные — прямо в bin64.
+        """
+        state = self.require_state()
+        if not state:
+            return 0
+        mod = state.mods.get(mod_id, {})
+        files = list(mod.get("files", []))
+        deleted_count = 0
+        LOGGER.info("Удаление мода без архива: %s", mod.get("name", mod_id))
+        for item in files:
+            rel = normalize_rel(item.get("rel", ""))
+            if not rel:
+                continue
+            candidates = [state.enabled_path(rel), state.disabled_path(mod_id, rel)]
+            for src in candidates:
+                if not src.exists() or not src.is_file():
+                    continue
+                src.unlink()
+                deleted_count += 1
+                LOGGER.info("Удалён файл мода: %s", src)
+        self._remove_empty_dirs(state.asibak_dir / mod_id)
+        return deleted_count
 
     def selected_file_path(self) -> Path | None:
         state = self.require_state()
