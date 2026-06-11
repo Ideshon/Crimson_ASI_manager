@@ -1580,6 +1580,71 @@ class AsiManagerApp:
                 mod_name = asi_files[0].stem
             return self._copy_files_to_target(tmp, staged, mod_name, source_label)
 
+    def _duplicate_ini_choice(self, mod_id: str, base: Path, files: list[Path]) -> str:
+        """Возвращает replace/keep/cancel для INI при замене уже установленного мода."""
+        state = self.require_state()
+        if not state:
+            return "replace"
+        mod = state.mods.get(mod_id, {})
+        old_ini_rels = []
+        for item in mod.get("files", []):
+            rel = normalize_rel(item.get("rel", ""))
+            if not rel.lower().endswith(".ini"):
+                continue
+            if state.enabled_path(rel).exists() or state.disabled_path(mod_id, rel).exists():
+                old_ini_rels.append(rel)
+
+        new_ini_rels = []
+        for file in files:
+            try:
+                rel = normalize_rel(file.relative_to(base))
+            except ValueError:
+                continue
+            if rel.lower().endswith(".ini"):
+                new_ini_rels.append(rel)
+
+        if not old_ini_rels or not new_ini_rels:
+            return "replace"
+
+        def compact(items: list[str]) -> str:
+            shown = items[:6]
+            text = "\n".join(f"  • {item}" for item in shown)
+            if len(items) > len(shown):
+                text += f"\n  • ... ещё {len(items) - len(shown)}"
+            return text
+
+        message = (
+            f"Мод «{mod.get('name', mod_id)}» уже установлен, и у старой и новой версии есть .ini-файлы.\n\n"
+            "Да — заменить старый .ini новым из добавляемого мода.\n"
+            "Нет — оставить старый .ini; новые .ini из добавляемого мода не копировать.\n"
+            "Отмена — отменить добавление мода.\n\n"
+            f"Старые .ini:\n{compact(old_ini_rels)}\n\n"
+            f"Новые .ini:\n{compact(new_ini_rels)}"
+        )
+        choice = messagebox.askyesnocancel("INI при замене мода", message, parent=self.root)
+        if choice is None:
+            LOGGER.info("Добавление дубликата отменено пользователем на выборе INI")
+            return "cancel"
+        if choice is False:
+            LOGGER.info("Пользователь выбрал оставить старые INI для мода %s", mod_id)
+            return "keep"
+        LOGGER.info("Пользователь выбрал заменить INI для мода %s", mod_id)
+        return "replace"
+
+    def _existing_ini_rels(self, mod_id: str) -> set[str]:
+        state = self.require_state()
+        if not state:
+            return set()
+        mod = state.mods.get(mod_id, {})
+        result: set[str] = set()
+        for item in mod.get("files", []):
+            rel = normalize_rel(item.get("rel", ""))
+            if not rel.lower().endswith(".ini"):
+                continue
+            if state.enabled_path(rel).exists() or state.disabled_path(mod_id, rel).exists():
+                result.add(rel)
+        return result
+
     def _copy_files_to_target(self, base: Path, files: list[Path], mod_name: str, source_label: str) -> int:
         state = self.require_state()
         if not state:
@@ -1589,6 +1654,9 @@ class AsiManagerApp:
         incoming_has_asi = any(file.suffix.lower() == ".asi" for file in files)
         mod_id = self._find_existing_mod_for_source_or_name(source_label, mod_name)
         duplicate_backup: Path | None = None
+        keep_old_ini_rels: set[str] = set()
+        skip_new_ini = False
+
         if not mod_id:
             mod_id = unique_mod_id(state.mods, mod_name)
             LOGGER.info("Создаётся новая запись мода: %s (%s)", mod_name, mod_id)
@@ -1601,16 +1669,39 @@ class AsiManagerApp:
                 "notes": "",
             }
         elif incoming_has_asi:
-            LOGGER.info("Найден дубликат мода: %s (%s). Старая версия будет заархивирована и удалена", mod_name, mod_id)
-            duplicate_backup = self._archive_and_move_previous_mod_files(mod_id)
-            state.mods[mod_id]["files"] = []
+            ini_choice = self._duplicate_ini_choice(mod_id, base, files)
+            if ini_choice == "cancel":
+                self.status_var.set("Добавление отменено: выбор INI отменён.")
+                return 0
+            if ini_choice == "keep":
+                keep_old_ini_rels = self._existing_ini_rels(mod_id)
+                skip_new_ini = bool(keep_old_ini_rels)
+
+            LOGGER.info(
+                "Найден дубликат мода: %s (%s). Старая версия будет заархивирована; keep_old_ini=%s",
+                mod_name,
+                mod_id,
+                sorted(keep_old_ini_rels),
+            )
+            duplicate_backup = self._archive_and_move_previous_mod_files(mod_id, keep_rels=keep_old_ini_rels)
+            kept_items = [
+                {"rel": rel, "added_at": now_iso(), "kept_from_previous_ini": True}
+                for rel in sorted(keep_old_ini_rels)
+                if state.enabled_path(rel).exists()
+            ]
+            state.mods[mod_id]["files"] = kept_items
         mod = state.mods[mod_id]
         existing_rels = {item["rel"] for item in mod.get("files", [])}
         copied_rels: list[str] = []
+        skipped_ini_rels: list[str] = []
 
         for file in files:
             rel = normalize_rel(file.relative_to(base))
             if not rel or rel.startswith("../"):
+                continue
+            if skip_new_ini and rel.lower().endswith(".ini"):
+                skipped_ini_rels.append(rel)
+                LOGGER.info("Новый INI пропущен, сохранён старый INI: %s", rel)
                 continue
             target = state.enabled_path(rel)
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -1625,12 +1716,21 @@ class AsiManagerApp:
         mod["enabled"] = True
         mod["updated_at"] = now_iso()
         mod["source"] = source_label
+        if skipped_ini_rels:
+            mod["ini_policy"] = {
+                "last_duplicate_choice": "keep_old",
+                "kept_old_ini": sorted(keep_old_ini_rels),
+                "skipped_new_ini": skipped_ini_rels,
+                "updated_at": now_iso(),
+            }
+        elif incoming_has_asi:
+            mod["ini_policy"] = {"last_duplicate_choice": "replace_or_no_ini_conflict", "updated_at": now_iso()}
         if duplicate_backup:
             mod.setdefault("duplicate_backups", []).append(str(duplicate_backup))
         self._sort_mod_files(mod)
-        return 1 if copied_rels else 0
+        return 1 if copied_rels or keep_old_ini_rels else 0
 
-    def _archive_and_move_previous_mod_files(self, mod_id: str) -> Path | None:
+    def _archive_and_move_previous_mod_files(self, mod_id: str, keep_rels: set[str] | None = None) -> Path | None:
         """Перед заменой дубликатом архивирует старую версию мода и удаляет старые файлы.
 
         Важно: распакованные .asi/.ini/.dll не оставляем внутри bin64/asiduplicates,
@@ -1639,6 +1739,7 @@ class AsiManagerApp:
         state = self.require_state()
         if not state:
             return None
+        keep_rels = {normalize_rel(rel) for rel in (keep_rels or set())}
         mod = state.mods.get(mod_id, {})
         files = list(mod.get("files", []))
         if not files:
@@ -1678,9 +1779,24 @@ class AsiManagerApp:
                     continue
 
                 zf.write(src, logical_rel)
-                manifest["files"].append({"rel": rel, "archived_as": logical_rel})
-                src.unlink()
-                LOGGER.info("Архивирован и удалён старый файл: %s", src)
+                file_manifest = {"rel": rel, "archived_as": logical_rel}
+                if rel in keep_rels:
+                    target = state.enabled_path(rel)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if src == enabled:
+                        file_manifest["kept"] = True
+                        file_manifest["kept_as"] = f"bin64/{rel}"
+                        LOGGER.info("Архивирован и оставлен старый INI: %s", src)
+                    else:
+                        shutil.move(str(src), str(target))
+                        file_manifest["kept"] = True
+                        file_manifest["kept_as"] = f"bin64/{rel}"
+                        LOGGER.info("Архивирован и восстановлен старый INI из asibak: %s -> %s", src, target)
+                else:
+                    src.unlink()
+                    file_manifest["deleted_after_archive"] = True
+                    LOGGER.info("Архивирован и удалён старый файл: %s", src)
+                manifest["files"].append(file_manifest)
 
             zf.writestr("_asi_manager_duplicate_info.json", json.dumps(manifest, ensure_ascii=False, indent=2))
 
